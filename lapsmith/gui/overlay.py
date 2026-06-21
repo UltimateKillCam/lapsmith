@@ -31,8 +31,10 @@ def _apply_no_activate(win_id: int):
                           cur | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST)
 
 
-def build_overlay(status_fn: Callable[[], dict], hotkey_help: str = ""):
+def build_overlay(status_fn: Callable[[], dict], hotkey_help: str = "",
+                  capturable_fn: Optional[Callable[[], bool]] = None):
     """Create (but do not exec) the overlay widget. Returns (app, widget).
+    `capturable_fn` -> current "show overlay in recordings" setting (bool).
     Raises RuntimeError with guidance if PySide6 is missing."""
     try:
         from PySide6 import QtWidgets, QtCore, QtGui
@@ -46,6 +48,11 @@ def build_overlay(status_fn: Callable[[], dict], hotkey_help: str = ""):
         def __init__(self):
             super().__init__()
             self.status_fn = status_fn
+            self._capturable_fn = capturable_fn or (lambda: False)
+            # app-level actions, set by app.py once they exist (so the always-on
+            # overlay can quit / restore the main window without the global hotkeys).
+            self.on_exit = None
+            self.on_show_main = None
             self.setWindowFlags(
                 QtCore.Qt.FramelessWindowHint
                 | QtCore.Qt.WindowStaysOnTopHint
@@ -54,6 +61,39 @@ def build_overlay(status_fn: Callable[[], dict], hotkey_help: str = ""):
             self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
             self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
             self.setWindowOpacity(0.92)
+
+            # --- always-visible control row (Exit / Main window + quit hint) ----
+            # The overlay is NON-ACTIVATING (WS_EX_NOACTIVATE) and translucent; this
+            # bar paints an OPAQUE hit area so the buttons reliably receive clicks
+            # without the overlay taking focus (even if it were click-through).
+            bar = QtWidgets.QWidget(self)
+            bar.setObjectName("ovbar")
+            bar.setAttribute(QtCore.Qt.WA_NoMousePropagation, True)
+            bar.setStyleSheet(
+                "#ovbar{background:rgba(16,18,22,235);"
+                "border:1px solid rgba(120,160,255,120);border-radius:8px;}"
+                "QPushButton{background:#232b31;color:#e6eaed;border:1px solid #2c343b;"
+                "border-radius:6px;padding:4px 12px;font-family:'Segoe UI';font-size:12px;}"
+                "QPushButton:hover{background:#2c343b;}"
+                "QPushButton#exit{color:#e5544b;border:1px solid #e5544b;font-weight:700;}"
+                "QPushButton#exit:hover{background:rgba(229,84,75,0.18);}"
+                "QLabel{color:#8b97a1;background:transparent;font-family:Consolas;font-size:11px;}")
+            exit_btn = QtWidgets.QPushButton("✕ Exit", bar)
+            exit_btn.setObjectName("exit")
+            exit_btn.setCursor(QtCore.Qt.PointingHandCursor)
+            exit_btn.clicked.connect(self._on_exit_clicked)
+            main_btn = QtWidgets.QPushButton("Main window", bar)
+            main_btn.setCursor(QtCore.Qt.PointingHandCursor)
+            main_btn.clicked.connect(self._on_main_clicked)
+            quit_hint = QtWidgets.QLabel("[Ctrl+F12] quit", bar)
+            bh = QtWidgets.QHBoxLayout(bar)
+            bh.setContentsMargins(8, 6, 8, 6)
+            bh.setSpacing(8)
+            bh.addWidget(exit_btn)
+            bh.addWidget(main_btn)
+            bh.addStretch(1)
+            bh.addWidget(quit_hint)
+
             self._label = QtWidgets.QLabel(self)
             self._label.setTextFormat(QtCore.Qt.RichText)
             self._label.setWordWrap(True)
@@ -71,6 +111,8 @@ def build_overlay(status_fn: Callable[[], dict], hotkey_help: str = ""):
             scroll.viewport().setAutoFillBackground(False)
             lay = QtWidgets.QVBoxLayout(self)
             lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(6)
+            lay.addWidget(bar)
             lay.addWidget(scroll)
             # small minimum so the layout never exceeds the window (no Qt min-size
             # warning); content that's taller (e.g. the baseline list) scrolls.
@@ -82,14 +124,36 @@ def build_overlay(status_fn: Callable[[], dict], hotkey_help: str = ""):
             self._timer.timeout.connect(self.refresh)
             self._timer.start(200)
 
+        def _on_exit_clicked(self):
+            if callable(self.on_exit):
+                self.on_exit()
+
+        def _on_main_clicked(self):
+            if callable(self.on_show_main):
+                self.on_show_main()
+
+        def apply_capture_affinity(self):
+            """(Re)apply the capture display-affinity for the CURRENT setting -
+            called on show and whenever the setting changes while the overlay is up
+            (so toggling it in Settings takes effect on the live overlay)."""
+            if not self.isVisible():
+                return
+            from ..vision import capture
+            try:
+                capture.set_window_capturable(int(self.winId()),
+                                              bool(self._capturable_fn()))
+            except Exception:
+                pass
+
         def showEvent(self, ev):
             super().showEvent(ev)
             hwnd = int(self.winId())
             _apply_no_activate(hwnd)
-            # keep the overlay OUT of the Heat-page screenshot (it was obscuring
-            # the Front-Left readings and failing OCR)
+            # By default keep the overlay OUT of the Heat-page screenshot (it was
+            # obscuring the Front-Left readings and failing OCR); if the user opted
+            # in (or the dev env var is set) it stays visible to capture instead.
             from ..vision import capture
-            capture.exclude_window_from_capture(hwnd)
+            capture.set_window_capturable(hwnd, bool(self._capturable_fn()))
 
         def refresh(self):
             self._label.setText(_render(self.status_fn()) +

@@ -234,7 +234,8 @@ def main(argv=None) -> int:
     # MUST precede QApplication creation (inside build_overlay) so Windows uses our
     # taskbar icon, not the generic Python one.
     _set_app_user_model_id()
-    app, overlay = build_overlay(ctrl.status, hotkey_help="")
+    app, overlay = build_overlay(ctrl.status, hotkey_help="",
+                                 capturable_fn=lambda: ctrl.overlay_capturable)
     from PySide6 import QtCore, QtWidgets, QtGui   # safe now - build_overlay succeeded
 
     # Cohesive dark theme, applied app-wide. The overlay shares this QApplication
@@ -298,6 +299,11 @@ def main(argv=None) -> int:
         shutdown["done"] = True
         log.info("shutting down - releasing telemetry + hotkeys")
         try:
+            if tray is not None:
+                tray.hide()        # remove the tray icon immediately on exit
+        except Exception:
+            log.exception("tray hide failed")
+        try:
             hk.stop()
         except Exception:
             log.exception("hotkey stop failed")
@@ -328,19 +334,29 @@ def main(argv=None) -> int:
             app_log=logfile, heat_frames=current_frames()),
         "captures_dir": lambda: capture.captures_dir(),
         "app_log": logfile,
+        # re-apply the overlay's capture display-affinity when the Settings
+        # checkbox changes, so it takes effect immediately on the live overlay.
+        "apply_overlay_capture": lambda: overlay.apply_capture_affinity(),
         "quit": real_quit,
     }
     window = main_window.build_main_window(ctrl, hooks)
     window.setWindowIcon(app_icon)
 
+    def show_window():
+        window.refresh()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    # The non-activating overlay carries its own Exit / Main-window buttons (the
+    # global hotkeys may not be registered without admin). Exit runs the SAME clean
+    # shutdown + quit as the tray; Main window restores the management window.
+    overlay.on_exit = real_quit
+    overlay.on_show_main = show_window
+
     # system tray: the app lives here when the window is closed/hidden.
     tray = None
     if QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
-        def show_window():
-            window.refresh()
-            window.show()
-            window.raise_()
-            window.activateWindow()
         tray = QtWidgets.QSystemTrayIcon(app_icon, app)
         tray.setToolTip(PRODUCT_NAME)
         menu = QtWidgets.QMenu()
@@ -551,6 +567,22 @@ def main(argv=None) -> int:
     # sitting over it during setup is fine.
     window.show()
     log.info("main window shown; entering Qt loop")
+
+    # Diagnostic: LAPSMITH_SELFTEST_EXIT=<ms> fires the overlay's Exit action after
+    # the loop starts, to verify the clean-shutdown path (UDP 5607 release + tray
+    # hide + quit) in a packaged build. Exercises the EXACT Exit-button callback.
+    _exit_ms = os.environ.get("LAPSMITH_SELFTEST_EXIT")
+    if _exit_ms:
+        try:
+            _ms = int(_exit_ms)
+        except ValueError:
+            _ms = 1500
+        def _selftest_exit():
+            log.info("SELFTEST_EXIT: invoking overlay Exit callback")
+            if callable(overlay.on_exit):
+                overlay.on_exit()
+        QtCore.QTimer.singleShot(_ms, _selftest_exit)
+
     try:
         rc = app.exec()
     finally:

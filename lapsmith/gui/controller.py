@@ -141,6 +141,10 @@ class Controller:
     # The management TABS (Dashboard/Previous/Logs/Settings/Help) live in the main
     # window now, not the overlay - this is just the live HUD's detail level.
     view_mode: str = "simple"          # "simple" | "advanced"
+    # Show the overlay in screen recordings/screenshots? OFF by default keeps it
+    # hidden from capture (WDA_EXCLUDEFROMCAPTURE) so it can't obscure the Heat-page
+    # tyre temps. The dev env var LAPSMITH_OVERLAY_CAPTURABLE force-enables it.
+    overlay_capturable: bool = False
 
     # ---- lifecycle -------------------------------------------------------
     def start(self):
@@ -882,6 +886,7 @@ class Controller:
             "tunes_folder": store.SESSIONS_DIR,
             "temp_mode": self.temp_mode,
             "view_mode": self.view_mode,
+            "overlay_capturable": self.overlay_capturable,
             "vision_api_opted_in": self.use_vision_api,
             "changes_per_test": self.changes_per_test,
             "laps_per_test": self.laps_per_test,

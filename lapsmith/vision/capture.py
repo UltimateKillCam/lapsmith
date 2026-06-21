@@ -102,12 +102,38 @@ def screen_size() -> Optional[Tuple[int, int]]:
 
 # Windows: keep the app's OWN windows out of screen captures, so the Heat-page
 # screenshot is game-only (our always-on-top overlay was obscuring Front-Left).
+WDA_NONE = 0x00000000                 # window visible to captures (Windows default)
 WDA_EXCLUDEFROMCAPTURE = 0x00000011   # window absent from captures (Win10 2004+)
+
+# Dev override: if set (to anything non-empty), the overlay is ALWAYS capturable,
+# regardless of the user's checkbox. Lets developers record the overlay easily.
+OVERLAY_CAPTURABLE_ENV = "LAPSMITH_OVERLAY_CAPTURABLE"
+
+
+def overlay_capturable(setting: bool = False) -> bool:
+    """Effective 'show overlay in captures' state: the user's setting, force-ON by
+    the dev env var."""
+    return bool(setting) or bool(os.environ.get(OVERLAY_CAPTURABLE_ENV))
+
+
+def set_window_capturable(win_id: int, capturable: bool) -> bool:
+    """SetWindowDisplayAffinity for our overlay. WDA_NONE makes the window VISIBLE
+    to screen capture; WDA_EXCLUDEFROMCAPTURE hides it (the default - flicker-free,
+    no per-frame hide). The dev env var forces capturable ON. Returns True on
+    success (Windows-only; no-op elsewhere)."""
+    import sys
+    if not sys.platform.startswith("win"):
+        return False
+    affinity = WDA_NONE if overlay_capturable(capturable) else WDA_EXCLUDEFROMCAPTURE
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.SetWindowDisplayAffinity(int(win_id), affinity))
+    except Exception:
+        return False
 
 
 def exclude_window_from_capture(win_id: int) -> bool:
-    """SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) - flicker-free, no per-frame
-    hide, works regardless of which thread grabs. Returns True on success."""
+    """Back-compat: unconditionally hide a window from capture."""
     import sys
     if not sys.platform.startswith("win"):
         return False

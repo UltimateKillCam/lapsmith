@@ -1481,6 +1481,18 @@ def test_tesseract_path():
     os.environ.pop("FH6_TESSERACT", None)
     os.unlink(fake)
 
+    # overlay capture display-affinity decision (Show overlay in recordings)
+    from lapsmith.vision import capture
+    os.environ.pop("LAPSMITH_OVERLAY_CAPTURABLE", None)
+    check("overlay hidden from capture by default (setting OFF, no env)",
+          capture.overlay_capturable(False) is False)
+    check("overlay capturable when the setting is ON",
+          capture.overlay_capturable(True) is True)
+    os.environ["LAPSMITH_OVERLAY_CAPTURABLE"] = "1"
+    check("LAPSMITH_OVERLAY_CAPTURABLE env force-enables capture",
+          capture.overlay_capturable(False) is True)
+    os.environ.pop("LAPSMITH_OVERLAY_CAPTURABLE", None)
+
 
 def _window(scenario, n=240):
     return [parse(simulator._build_packet(simulator.frame(i * 0.05, scenario)))

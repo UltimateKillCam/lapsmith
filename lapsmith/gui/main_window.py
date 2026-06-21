@@ -404,6 +404,13 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             self.set_view.setCurrentText(getattr(self.ctrl, "view_mode", "simple"))
             self.set_view.currentTextChanged.connect(self.ctrl.set_view_mode)
             form.addRow("Overlay default view", self.set_view)
+
+            # Show the overlay in screen recordings/screenshots (default OFF). Uses
+            # `clicked` (user action only) so reverting on Cancel doesn't re-trigger.
+            self.set_capture = QtWidgets.QCheckBox("Show overlay in screen recordings")
+            self.set_capture.setChecked(bool(getattr(self.ctrl, "overlay_capturable", False)))
+            self.set_capture.clicked.connect(self._toggle_capture)
+            form.addRow("Screen recording", self.set_capture)
             lay.addLayout(form)
 
             hdr = QtWidgets.QHBoxLayout()
@@ -467,6 +474,30 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             name = self.names_table.item(r, 1).text() if self.names_table.item(r, 1) else ""
             self.ctrl.rename_car(ordinal, name)
             self._toast(f"Saved #{ordinal} -> {name}")
+
+        def _toggle_capture(self, checked):
+            """Ticking ON requires confirmation (it can let the overlay obscure the
+            Heat-page temps); unticking is immediate. The change applies to the live
+            overlay at once via the apply_overlay_capture hook."""
+            if checked:
+                ok = QtWidgets.QMessageBox.warning(
+                    self, "Show overlay in recordings?",
+                    "With this on, the overlay will appear in screen recordings and "
+                    "screenshots — including the tyre-temperature screenshots LapSmith "
+                    "takes to read your Heat page. Make sure the overlay is positioned "
+                    "so it doesn't cover any of the tyre temperatures on the Heat page, "
+                    "or those temps may not read and LapSmith will fall back to tuning "
+                    "camber by lap time. Move the overlay out of the way before bringing "
+                    "up the Heat page.",
+                    QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel,
+                    QtWidgets.QMessageBox.Cancel)
+                if ok != QtWidgets.QMessageBox.Ok:
+                    self.set_capture.setChecked(False)   # leave it OFF, no change
+                    return
+            self.ctrl.overlay_capturable = bool(checked)
+            self.hooks.get("apply_overlay_capture", lambda: None)()
+            self._toast("Overlay will show in recordings." if checked
+                        else "Overlay hidden from recordings.")
 
         def _forget_name(self):
             r = self.names_table.currentRow()
