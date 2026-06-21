@@ -70,6 +70,21 @@ for pkg in ("onnxruntime", "rapidocr_onnxruntime"):
 hiddenimports += ["keyboard", "fastapi", "uvicorn", "pytesseract", "PIL", "mss",
                   "onnxruntime", "rapidocr_onnxruntime"]
 
+# Fail the build LOUD if a runtime-critical module the app needs is not importable
+# in the build env: a `hiddenimports` entry for a module that isn't installed is
+# SILENTLY skipped, which is exactly how a frozen build shipped with NO global
+# hotkeys (F8 dead). `keyboard` is required for the advance/mark hotkeys.
+import importlib
+for _required in ("keyboard",):
+    try:
+        importlib.import_module(_required)
+    except Exception as _e:
+        raise SystemExit(
+            f"BUILD ABORTED: required module '{_required}' is not importable in the "
+            f"build environment, so it would be MISSING from the bundle and global "
+            f"hotkeys (F8/F9/...) would not work. Install deps first:\n"
+            f"    pip install -r requirements-gui.txt\n({_e})")
+
 # Belt-and-suspenders: explicitly exclude the heavy Qt modules the app never uses,
 # so no transitive reference can drag them (or their big DLLs) back in.
 qt_excludes = [

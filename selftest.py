@@ -722,6 +722,61 @@ def test_auto_lap():
           abs(c2.best_segment - 50.0) < 1e-6 and len(c2.state.converged_levers) >= 1)
 
 
+def test_f8_rivals_autolap():
+    """Regression for v0.1.3: F8 stopped reaching lap tracking because the frozen
+    build silently shipped WITHOUT the `keyboard` dep (no global hotkeys). Guards
+    BOTH the hotkey wiring (advance=F8, keyboard importable) AND the full live
+    chain detect -> setup -> F8(baseline_applied) -> DRIVE_AUTO -> tick -> AUTO,
+    through the real UDP listener + parser + watcher (not a fake feed)."""
+    print("\n== regression: F8 -> AUTO lap-tracking in Rivals (full chain) ==")
+    import socket, time as _time
+    from lapsmith.gui import controller as C
+    from lapsmith.gui.hotkeys import HotkeyManager, DEFAULT_BINDINGS
+    from lapsmith.telemetry.listener import TelemetryListener
+    from lapsmith.state.tune_state import CarLimits
+    from lapsmith import simulator
+
+    # advance is F8, and `keyboard` MUST be importable so the FROZEN build can
+    # register global hotkeys (it once shipped without it -> F8 dead).
+    check("advance hotkey bound to F8", DEFAULT_BINDINGS["advance"] == "f8")
+    check("keyboard dep importable (so the frozen build can register hotkeys)",
+          HotkeyManager({}).available())
+
+    port = 5661
+    ctrl = C.Controller(port=port)
+    ctrl.listener = TelemetryListener(port=port); ctrl.listener.start()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def send(t):
+        sock.sendto(simulator._build_packet(simulator.frame(t, "rivals")), ("127.0.0.1", port))
+    try:
+        for t in (0.1, 0.2, 0.3):
+            send(t)
+        _time.sleep(0.2)
+        ctrl.poll_identity()
+        check("car detected from rivals telemetry", ctrl.identity is not None)
+        # START TUNING (button path) -> APPLY_BASELINE
+        ctrl.reset_session(); ctrl.confirm_car()
+        ctrl.apply_setup("road", CarLimits(), front_weight_pct=50.0,
+                         target_class=ctrl.identity.target_class)
+        check("setup -> APPLY_BASELINE", ctrl.phase == C.APPLY_BASELINE)
+        # F8 at APPLY_BASELINE -> baseline_applied -> DRIVE_AUTO (detecting)
+        ctrl.baseline_applied()
+        check("F8 -> DRIVE_AUTO, detecting", ctrl.phase == C.DRIVE_AUTO and ctrl.mode is None)
+        # drive across a lap boundary (LapNumber 0 -> 1) so the timer is seen advancing
+        for t in (19.6, 19.8, 20.0, 20.2, 20.4, 20.6):
+            send(t)
+        _time.sleep(0.25)
+        for _ in range(8):
+            ctrl.tick()
+            if ctrl.mode == C.MODE_AUTO:
+                break
+            _time.sleep(0.05)
+        check("driving a lap engages AUTO-LAP (F8 reaches lap tracking)",
+              ctrl.mode == C.MODE_AUTO)
+    finally:
+        ctrl.listener.stop()
+
+
 def test_batch_changes():
     print("\n== batch changes (evidence together, search rate-limited, batch revert) ==")
     from lapsmith.gui import controller as C
@@ -1604,6 +1659,7 @@ if __name__ == "__main__":
     test_gui_controller()
     test_fitness_resolution()
     test_auto_lap()
+    test_f8_rivals_autolap()
     test_batch_changes()
     test_multi_lap_fitness()
     test_lateral_capture_axis()

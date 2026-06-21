@@ -53,24 +53,34 @@ def build_overlay(status_fn: Callable[[], dict], hotkey_help: str = "",
             # overlay can quit / restore the main window without the global hotkeys).
             self.on_exit = None
             self.on_show_main = None
-            self._drag_offset = None        # set on body press; cleared on release
             self._saved_pos = None          # last position, so it reopens where left
+            self._drag_offset = None        # set on a body press; cleared on release
+            self.setObjectName("overlayRoot")
             self.setWindowFlags(
                 QtCore.Qt.FramelessWindowHint
                 | QtCore.Qt.WindowStaysOnTopHint
                 | QtCore.Qt.Tool
                 | QtCore.Qt.WindowDoesNotAcceptFocus)
-            self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+            # NO WA_TranslucentBackground: a per-pixel-translucent window is
+            # click-through on its transparent pixels, which is why only the buttons
+            # used to be grabbable. We paint a FULL, OPAQUE panel (so the OS delivers
+            # clicks across the ENTIRE overlay -> draggable anywhere) and use
+            # windowOpacity for the see-through HUD look (uniform alpha is fully
+            # hit-testable, unlike per-pixel alpha).
+            self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
             self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
+            self.setStyleSheet(
+                "#overlayRoot{background:#14181b;"
+                "border:1px solid rgba(120,160,255,140);border-radius:10px;}")
             self.setWindowOpacity(0.92)
 
             # --- always-visible control row (Exit / Main window + quit hint) ----
-            # The overlay is NON-ACTIVATING (WS_EX_NOACTIVATE) and translucent; this
-            # bar paints an OPAQUE hit area so the buttons reliably receive clicks
-            # without the overlay taking focus (even if it were click-through).
+            # The buttons consume their own clicks (so a button press never starts a
+            # drag); pressing the row BACKGROUND falls through to the overlay's drag
+            # handlers like the rest of the body.
             bar = QtWidgets.QWidget(self)
             bar.setObjectName("ovbar")
-            bar.setAttribute(QtCore.Qt.WA_NoMousePropagation, True)
+            bar.setAttribute(QtCore.Qt.WA_StyledBackground, True)
             bar.setStyleSheet(
                 "#ovbar{background:rgba(16,18,22,235);"
                 "border:1px solid rgba(120,160,255,120);border-radius:8px;}"
@@ -100,9 +110,9 @@ def build_overlay(status_fn: Callable[[], dict], hotkey_help: str = "",
             self._label.setTextFormat(QtCore.Qt.RichText)
             self._label.setWordWrap(True)
             self._label.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+            # transparent: the overlay root paints the panel now (one border, not two)
             self._label.setStyleSheet(
-                "color:#eaeaea; background:rgba(16,18,22,205);"
-                "border:1px solid rgba(120,160,255,120); border-radius:10px;"
+                "color:#eaeaea; background:transparent; border:0;"
                 "padding:12px; font-family:Consolas,monospace; font-size:13px;")
             scroll = QtWidgets.QScrollArea(self)
             scroll.setWidget(self._label)
@@ -147,10 +157,10 @@ def build_overlay(status_fn: Callable[[], dict], hotkey_help: str = "",
             except Exception:
                 pass
 
-        # --- click-and-drag to move (works with the non-activating overlay) ----
-        # A press on the BODY starts a drag; the Exit / Main-window buttons consume
-        # their own presses, so they never start a drag (and a drag never reaches
-        # them). The window moves by the cursor delta - no focus required.
+        # --- click-and-drag to move, ANYWHERE on the overlay body ---------------
+        # A left-press that isn't consumed by a child (the Exit/Main-window buttons
+        # consume theirs) bubbles up here and starts a drag; the window then follows
+        # the cursor. No focus needed - the overlay stays non-activating.
         def mousePressEvent(self, ev):
             if ev.button() == QtCore.Qt.LeftButton:
                 self._drag_offset = (ev.globalPosition().toPoint()
@@ -168,7 +178,7 @@ def build_overlay(status_fn: Callable[[], dict], hotkey_help: str = "",
 
         def mouseReleaseEvent(self, ev):
             if self._drag_offset is not None:
-                self._saved_pos = self.pos()    # remember where the user left it
+                self._saved_pos = self.pos()     # remember where the user left it
                 self._drag_offset = None
                 ev.accept()
             else:
