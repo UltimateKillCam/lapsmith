@@ -14,6 +14,8 @@ This matters, so it's up front: LapSmith only **reads**. It doesn't inject code,
 
 ## Install
 
+**[⬇ Download the latest version](https://github.com/UltimateKillCam/lapsmith/releases/latest)**
+
 Two options, no Python or command line required:
 
 - **Installer** — download `LapSmith-Setup.exe`, run it, done. Adds Start-menu and optional desktop shortcuts plus an uninstaller.
