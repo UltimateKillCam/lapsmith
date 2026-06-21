@@ -51,6 +51,9 @@ class CarIdentity:
 
 
 def class_letter(car_class_enum: int) -> str:
+    """Raw CarClass-enum -> letter (diagnostic only). The DISPLAYED class comes from
+    the car's PI via the shared table (class_for_pi), so the 'PI nnn (class)' label
+    and the Target-class dropdown can't disagree."""
     return _CLASS_LETTER.get(car_class_enum, "?")
 
 
@@ -58,13 +61,11 @@ def suggest_target_class(pi: int) -> str:
     """The car's OWN class (letter + PI ceiling) from its PI - the default build
     target. No longer bumps the car up a class; the user can override it in setup.
     Uses the shared class table so classes/ceilings stay consistent everywhere."""
-    from .knowledge.baseline import PI_CEILING, TARGET_CLASS_ORDER
+    from .knowledge.baseline import class_for_pi, PI_CEILING
     if pi <= 0:
         return f"A {PI_CEILING['A']}"
-    for c in TARGET_CLASS_ORDER:
-        if pi <= PI_CEILING[c]:
-            return f"{c} {PI_CEILING[c]}"
-    return f"X {PI_CEILING['X']}"
+    c = class_for_pi(pi)
+    return f"{c} {PI_CEILING[c]}"
 
 
 def is_live(packet: Optional[Packet]) -> bool:
@@ -73,6 +74,7 @@ def is_live(packet: Optional[Packet]) -> bool:
 
 
 def identify(packet: Packet) -> CarIdentity:
+    from .knowledge.baseline import class_for_pi
     raw_dt = packet.drivetrain_type
     ncyl = packet.num_cylinders
     # Log the RAW pre-insert car-info ints so a misdetect can be diagnosed from
@@ -87,7 +89,7 @@ def identify(packet: Packet) -> CarIdentity:
         name=ordinals.name_for(packet.car_ordinal),
         pi=packet.car_pi,
         car_class_enum=packet.car_class,
-        class_letter=class_letter(packet.car_class),
+        class_letter=class_for_pi(packet.car_pi),   # PI-derived, shared table
         drivetrain=_DRIVETRAIN.get(raw_dt, "?"),
         known=ordinals.is_known(packet.car_ordinal),
         target_class=suggest_target_class(packet.car_pi),

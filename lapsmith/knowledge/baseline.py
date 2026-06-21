@@ -12,16 +12,24 @@ from typing import Optional
 
 from ..state.tune_state import Tune, CarLimits, STOCK
 
-# Class letter -> PI ceiling (Forza's class bands). SINGLE source of truth for the
-# Target-class dropdown, the auto-suggested target, the build target, and the
-# checklist display, so the classes and ceilings stay consistent everywhere.
-# ("R" is a legacy alias kept so any old "R 998" string still resolves.)
-PI_CEILING = {
-    "D": 500, "C": 600, "B": 700, "A": 800, "S1": 900, "S2": 998, "X": 999,
-    "R": 998,
-}
+# FH6 class -> PI ceiling (the upper PI bound for that class), low -> high. The
+# SINGLE source of truth: the detected-class label, the Target-class dropdown, the
+# auto-suggested target, the build target, and the checklist all derive from this
+# so they cannot drift. A car's class is the LOWEST class whose ceiling its PI does
+# not exceed (PI 600 -> B, PI 601 -> A). "R" sits between S2 and X.
+CLASS_CEILINGS = (("D", 400), ("C", 500), ("B", 600), ("A", 700),
+                  ("S1", 800), ("S2", 900), ("R", 998), ("X", 999))
+PI_CEILING = dict(CLASS_CEILINGS)
 # Low -> high, for the user-facing Target-class dropdown.
-TARGET_CLASS_ORDER = ("D", "C", "B", "A", "S1", "S2", "X")
+TARGET_CLASS_ORDER = tuple(c for c, _ in CLASS_CEILINGS)
+
+
+def class_for_pi(pi: int) -> str:
+    """The car's class: the lowest class whose PI ceiling its PI does not exceed."""
+    for letter, ceil in CLASS_CEILINGS:
+        if pi <= ceil:
+            return letter
+    return "X"
 
 # Range-relative baselines (fraction of the car's slider range, 0=min .. 1=max).
 # (front, rear); rear slightly higher than front for rake on tarmac.

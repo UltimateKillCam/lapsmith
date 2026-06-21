@@ -53,6 +53,8 @@ def build_overlay(status_fn: Callable[[], dict], hotkey_help: str = "",
             # overlay can quit / restore the main window without the global hotkeys).
             self.on_exit = None
             self.on_show_main = None
+            self._drag_offset = None        # set on body press; cleared on release
+            self._saved_pos = None          # last position, so it reopens where left
             self.setWindowFlags(
                 QtCore.Qt.FramelessWindowHint
                 | QtCore.Qt.WindowStaysOnTopHint
@@ -145,8 +147,37 @@ def build_overlay(status_fn: Callable[[], dict], hotkey_help: str = "",
             except Exception:
                 pass
 
+        # --- click-and-drag to move (works with the non-activating overlay) ----
+        # A press on the BODY starts a drag; the Exit / Main-window buttons consume
+        # their own presses, so they never start a drag (and a drag never reaches
+        # them). The window moves by the cursor delta - no focus required.
+        def mousePressEvent(self, ev):
+            if ev.button() == QtCore.Qt.LeftButton:
+                self._drag_offset = (ev.globalPosition().toPoint()
+                                     - self.frameGeometry().topLeft())
+                ev.accept()
+            else:
+                super().mousePressEvent(ev)
+
+        def mouseMoveEvent(self, ev):
+            if self._drag_offset is not None and (ev.buttons() & QtCore.Qt.LeftButton):
+                self.move(ev.globalPosition().toPoint() - self._drag_offset)
+                ev.accept()
+            else:
+                super().mouseMoveEvent(ev)
+
+        def mouseReleaseEvent(self, ev):
+            if self._drag_offset is not None:
+                self._saved_pos = self.pos()    # remember where the user left it
+                self._drag_offset = None
+                ev.accept()
+            else:
+                super().mouseReleaseEvent(ev)
+
         def showEvent(self, ev):
             super().showEvent(ev)
+            if self._saved_pos is not None:
+                self.move(self._saved_pos)      # reopen where the user left it
             hwnd = int(self.winId())
             _apply_no_activate(hwnd)
             # By default keep the overlay OUT of the Heat-page screenshot (it was

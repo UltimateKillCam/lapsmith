@@ -418,11 +418,17 @@ def test_identity_autodetect():
     ident = identity.identify(pkt)
     check(f"car name from ordinal ({ident.name})", "CLK GTR" in ident.name)
     check("drivetrain AWD from DrivetrainType", ident.drivetrain == "AWD")
-    check(f"target class from PI 800 -> A 800 (own class, no bump) (got {ident.target_class})",
-          ident.target_class == "A 800")
-    check("PI 950 -> S2 998 (own class)", identity.suggest_target_class(950) == "S2 998")
-    check("PI 650 -> B 700 (own class, not bumped to A)",
-          identity.suggest_target_class(650) == "B 700")
+    check(f"detected class label from PI 800 -> S1 (shared table) (got {ident.class_letter})",
+          ident.class_letter == "S1")
+    check(f"target class from PI 800 -> S1 800 (own class, no bump) (got {ident.target_class})",
+          ident.target_class == "S1 800")
+    check("PI 600 -> B 600 (FH6: 600 is B's ceiling)",
+          identity.suggest_target_class(600) == "B 600")
+    check("PI 601 -> A 700 (601 crosses into A)",
+          identity.suggest_target_class(601) == "A 700")
+    check("PI 950 -> R 998 (new class between S2 and X)",
+          identity.suggest_target_class(950) == "R 998")
+    check("PI 650 -> A 700 (own class)", identity.suggest_target_class(650) == "A 700")
     # unknown ordinal (a later-update car) still works, shows Car #<n>
     check("unknown ordinal -> 'Car #<n>'", ordinals.name_for(987654) == "Car #987654")
     check("unknown ordinal not 'known'", not ordinals.is_known(987654))
@@ -446,15 +452,19 @@ def test_gui_controller():
     # the choice flows through to the baseline + the saved car_class metadata.
     check("target class defaults to detected (no override)",
           ctrl.target_class == ctrl.identity.target_class)
-    ctrl.apply_setup("road", lim, front_weight_pct=48.0, target_class="S2 998")
+    ctrl.apply_setup("road", lim, front_weight_pct=48.0, target_class="R 998")
     check("user-selected target class wins + flows to car_class metadata",
-          ctrl.target_class == "S2 998" and ctrl._meta()["car_class"] == "S2 998")
-    # the dropdown options + default label come from the shared class table
+          ctrl.target_class == "R 998" and ctrl._meta()["car_class"] == "R 998")
+    # the dropdown options + default label come from the shared class table, and
+    # MUST match what the detected-class label derives (single source of truth)
     from lapsmith.knowledge import baseline as _bl
     opts = _bl.target_class_options()
-    check("target dropdown options reuse the class table (D..X with ceilings)",
-          opts == ["D 500", "C 600", "B 700", "A 800", "S1 900", "S2 998", "X 999"]
-          and _bl.class_target_label("B") == "B 700")
+    check("target dropdown options reuse the FH6 class table (incl. R)",
+          opts == ["D 400", "C 500", "B 600", "A 700", "S1 800", "S2 900", "R 998", "X 999"]
+          and _bl.class_target_label("B") == "B 600")
+    check("detected-class label and dropdown agree (PI 600 -> B 600)",
+          _bl.class_for_pi(600) == "B" and _bl.class_target_label("B") == "B 600"
+          and _bl.class_for_pi(601) == "A")
     check("AWD detected -> baseline keeps centre diff", ctrl.baseline.diff_center > 0)
 
     # drive a bottoming test -> controller computes a clamped change
@@ -1332,6 +1342,31 @@ def test_car_import():
           ordinals.name_for(920001) == "Volkswagen Golf Rallye"
           and ordinals.name_for(920002) == "My Hand-Typed Name"
           and s["imported"] == 1 and s["already"] == 1)
+
+    # DISPLAY-time repair: a name already stored as a dict-repr blob (old bug, never
+    # re-imported) must show the clean display_name, not the whole {...} object.
+    blob = ("{'display_name': '1989 Volkswagen Golf Rallye', 'year': 1989, "
+            "'make': 'Volkswagen', 'model': 'Golf Rallye', 'car_id': 930001}")
+    check("_clean_name extracts display_name from a dict-repr blob",
+          ordinals._clean_name(blob) == "1989 Volkswagen Golf Rallye"
+          and ordinals._clean_name("Plain Name") == "Plain Name")
+    ordinals._USER_MAP[930001] = blob          # simulate the bad on-disk value
+    check("name_for shows the clean name, not the raw record dict",
+          ordinals.name_for(930001) == "1989 Volkswagen Golf Rallye")
+    # load_user_map repairs a file full of blobs AND rewrites it clean
+    import json as _json
+    bad_path = os.path.join(d, "bad_names.json")
+    with open(bad_path, "w", encoding="utf-8") as _f:
+        _json.dump({"930002": blob, "930003": "Already Clean"}, _f)
+    ordinals._USER_MAP.clear()
+    ordinals.load_user_map(bad_path)
+    rewritten = _json.load(open(bad_path, encoding="utf-8"))
+    check("load_user_map cleans blobs in memory and rewrites the file",
+          ordinals.name_for(930002) == "1989 Volkswagen Golf Rallye"
+          and rewritten["930002"] == "1989 Volkswagen Golf Rallye"
+          and rewritten["930003"] == "Already Clean")
+    ordinals._USER_MAP.clear()                 # restore the earlier store state
+    ordinals.set_store_path(os.path.join(d, "cn.json"))
     # the credited Nexus link the dialog/CLI point at (no bundled data)
     check("import points users at the Nexus FH6 Car ID List page",
           car_import.NEXUS_CAR_LIST_URL == "https://www.nexusmods.com/forzahorizon6/mods/309"

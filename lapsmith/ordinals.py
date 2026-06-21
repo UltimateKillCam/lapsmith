@@ -11,9 +11,34 @@ community tools (e.g. the car_data.h table in FH6 telemetry dashboards).
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
+import re
 from typing import Dict, Optional
+
+_DISPLAY_RE = re.compile(r"""['"]display_name['"]\s*:\s*['"](.*?)['"]""")
+
+
+def _clean_name(value) -> str:
+    """A stored name may be a serialized car-record blob from an old import bug
+    (e.g. "{'display_name': '1989 VW Golf Rallye', 'year': 1989, ...}"). Pull just
+    the display name so the UI shows the clean name, not the whole dict."""
+    s = str(value).strip()
+    if s.startswith("{") or "display_name" in s:
+        try:
+            obj = ast.literal_eval(s)
+            if isinstance(obj, dict):
+                for key in ("display_name", "name", "model"):
+                    v = obj.get(key)
+                    if v:
+                        return str(v).strip()
+        except (ValueError, SyntaxError):
+            pass
+        m = _DISPLAY_RE.search(s)
+        if m:
+            return m.group(1).strip()
+    return s
 
 # Small seed set (display only). Extend via a user JSON map - see load_user_map.
 ORDINALS: Dict[int, str] = {
@@ -38,7 +63,7 @@ def name_for(ordinal: Optional[int]) -> str:
     if ordinal is None or ordinal <= 0:
         return "Unknown car"
     if ordinal in _USER_MAP:
-        return _USER_MAP[ordinal]
+        return _clean_name(_USER_MAP[ordinal])
     return ORDINALS.get(ordinal, f"Car #{ordinal}")
 
 
@@ -136,12 +161,18 @@ def load_user_map(path: str) -> int:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         n = 0
+        repaired = False
         for k, v in raw.items():
             try:
-                _USER_MAP[int(k)] = str(v)
+                clean = _clean_name(v)        # repair old serialized-record blobs
+                if clean != str(v):
+                    repaired = True
+                _USER_MAP[int(k)] = clean
                 n += 1
             except (TypeError, ValueError):
                 continue
+        if repaired:
+            _flush(path)                      # rewrite the store with clean names
         return n
     except (json.JSONDecodeError, OSError):
         return 0
