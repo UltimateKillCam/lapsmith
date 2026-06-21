@@ -1,0 +1,524 @@
+"""The MANAGEMENT window: a normal, focusable QMainWindow used between sessions.
+
+This is the second of the two UI surfaces (the first is the non-activating live
+overlay). Because it's only used when NOT driving, it can take focus and use real
+tabs + mouse buttons:
+
+  Dashboard/Stats | Previous Tunes | Logs | Settings | Help
+
+A prominent START TUNING button begins a session (car detect/name + discipline +
+bounds setup happen HERE, focus is fine), then the app hides this window and shows
+the overlay for the drive. It is a presentation layer over the SAME Controller -
+it reads the controller's data providers and calls its edit methods; it never
+touches the tuning logic or file outputs.
+
+PySide6 is imported lazily so the package imports without it.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+from typing import Callable, Dict, Optional
+
+from .. import PRODUCT_NAME
+
+
+# Rendered by the Help tab's QTextBrowser (themed by the app stylesheet + the
+# browser's default style sheet). Plain HTML so links open in the system browser.
+_HELP_HTML = """\
+<h2>LapSmith — quick guide</h2>
+<p>LapSmith reads the game's telemetry and your tyre <b>Heat</b> page, then tells you the exact values to
+enter. You drive and type the values in yourself — it never touches the game.</p>
+<h3>How a session goes</h3>
+<ol>
+<li><b>Select car</b> — confirm the detected car (name it if it's new), then pick the discipline and how
+wide the slider search ranges should be.</li>
+<li><b>Apply the tune</b> — type the shown values into the in-game tune menu, then load a Rivals event.</li>
+<li><b>Baseline</b> — drive 2 laps. Lap 1 is a warm-up and is ignored; lap 2 sets your baseline.</li>
+<li><b>Make the change</b> — apply the one change LapSmith shows, <b>restart</b> the event, drive 2 laps.</li>
+<li><b>Test</b> — lap 1 warm-up (ignored), lap 2 timed against your best. Faster is kept, slower reverted.</li>
+<li><b>Converged</b> — when nothing more helps, the final tune and shareable files are saved.</li>
+</ol>
+<h3>Hotkeys</h3>
+<table>
+<tr><td><b>F8</b></td><td>advance / confirm / apply</td></tr>
+<tr><td><b>F11</b></td><td>end manual test</td></tr>
+<tr><td><b>F9 / F10</b></td><td>manual segment start / end (free-roam, no lap timer)</td></tr>
+<tr><td><b>F6</b></td><td>simple / advanced overlay view</td></tr>
+<tr><td><b>F7</b></td><td>switch tab</td></tr>
+<tr><td><b>Ctrl+F12</b></td><td>quit</td></tr>
+</table>
+<h3>Tyre temps</h3>
+<p>Read locally on your PC, fully offline. If a lap's Heat page can't be read, camber is tuned by lap time
+instead, so it never blocks.</p>
+<h3>Car names</h3>
+<p>Telemetry only gives a numeric car ID. LapSmith asks you to name a car the first time it sees one, and you
+can bulk-import the community ID→name list under <b>Settings → Import car names</b> (from the Nexus "Forza
+Horizon 6 Car ID List" by xEDWARDSZz). Your own names always win.</p>
+<h3>Settings worth knowing</h3>
+<ul>
+<li><b>Telemetry port</b> — must match the game's Data Out port; applies on next start.</li>
+<li><b>Tyre-temp reader</b> — leave on auto.</li>
+<li><b>Cloud reader</b> — off by default; only used if you opt in and set a key.</li>
+<li><b>Overlay default view</b> — simple or advanced.</li>
+</ul>
+<h3>Outputs</h3>
+<p>The value sheet, JSON, and optn.club block are values to <b>type in</b> — not an in-game share code.</p>
+"""
+
+
+def build_main_window(ctrl, hooks: Dict[str, Callable]):
+    """Create (don't show) the management window. `hooks` supplies app-level
+    actions: start_tuning(), support_bundle()->path|None, quit(). Returns the
+    window (a QMainWindow). Raises RuntimeError with guidance if PySide6 missing."""
+    try:
+        from PySide6 import QtWidgets, QtCore, QtGui
+    except Exception as e:  # pragma: no cover - optional dep
+        raise RuntimeError(
+            "PySide6 is required for the main window. Install GUI extras:\n"
+            "  pip install PySide6 keyboard\n"
+            f"(import error: {e})")
+
+    def _open_path(path: Optional[str]):
+        if not path:
+            return
+        try:
+            if os.path.isfile(path) or os.path.isdir(path):
+                os.startfile(path)            # Windows
+        except Exception:
+            pass
+
+    class MainWindow(QtWidgets.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.ctrl = ctrl
+            self.hooks = hooks
+            self.setWindowTitle(PRODUCT_NAME)
+            self.resize(880, 640)
+
+            central = QtWidgets.QWidget()
+            central.setObjectName("central")
+            self.setCentralWidget(central)
+            root = QtWidgets.QVBoxLayout(central)
+            root.setContentsMargins(16, 16, 16, 12)
+            root.setSpacing(12)
+
+            # prominent START TUNING bar (filled-green primary button)
+            top = QtWidgets.QHBoxLayout()
+            top.setSpacing(12)
+            self.start_btn = QtWidgets.QPushButton("  ▶  START TUNING  ")
+            self.start_btn.setObjectName("primary")
+            self.start_btn.setMinimumHeight(44)
+            self.start_btn.setCursor(QtCore.Qt.PointingHandCursor)
+            self.start_btn.clicked.connect(self._start_tuning)
+            top.addWidget(self.start_btn)
+            self.status_lbl = QtWidgets.QLabel("")
+            self.status_lbl.setObjectName("muted")
+            top.addWidget(self.status_lbl, 1)
+            root.addLayout(top)
+
+            self.tabs = QtWidgets.QTabWidget()
+            root.addWidget(self.tabs, 1)
+            self.tabs.addTab(self._build_dashboard(), "Dashboard")
+            self.tabs.addTab(self._build_previous(), "Previous Tunes")
+            self.tabs.addTab(self._build_logs(), "Logs")
+            self.tabs.addTab(self._build_settings(), "Settings")
+            self.tabs.addTab(self._build_help(), "Help")
+            self.tabs.currentChanged.connect(lambda *_: self.refresh())
+
+            self.refresh()
+
+        # ----- card / chip helpers --------------------------------------
+        def _wrap_card(self, inner_layout):
+            """Put a tab's content layout inside a card panel: 16px outer margin
+            (around the tab content) + a panel with 1px hairline, radius 10, and
+            16px inner padding / 12px element spacing."""
+            page = QtWidgets.QWidget()
+            page.setObjectName("tabPage")
+            outer = QtWidgets.QVBoxLayout(page)
+            outer.setContentsMargins(16, 16, 16, 16)
+            card = QtWidgets.QFrame()
+            card.setObjectName("card")
+            inner_layout.setContentsMargins(16, 16, 16, 16)
+            inner_layout.setSpacing(12)
+            card.setLayout(inner_layout)
+            outer.addWidget(card)
+            return page
+
+        def _stat_chip(self, label):
+            """A dashboard stat chip: big accent number over a small muted label.
+            Returns (frame, number_label) so the number can be refreshed."""
+            frame = QtWidgets.QFrame()
+            frame.setObjectName("statChip")
+            v = QtWidgets.QVBoxLayout(frame)
+            v.setContentsMargins(14, 12, 14, 12)
+            v.setSpacing(2)
+            num = QtWidgets.QLabel("-")
+            num.setObjectName("statNumber")
+            lbl = QtWidgets.QLabel(label)
+            lbl.setObjectName("statLabel")
+            v.addWidget(num)
+            v.addWidget(lbl)
+            return frame, num
+
+        # ----- Dashboard -------------------------------------------------
+        def _build_first_run_note(self):
+            """A plain-language 'getting started' panel - shown until the first tune
+            exists. Everything here is in-game; there is no command line."""
+            note = QtWidgets.QFrame()
+            note.setObjectName("noteCard")
+            v = QtWidgets.QVBoxLayout(note)
+            v.setContentsMargins(14, 12, 14, 12)
+            v.setSpacing(4)
+            title = QtWidgets.QLabel("Getting started — turn on the game's telemetry")
+            title.setObjectName("noteTitle")
+            body = QtWidgets.QLabel(
+                "1.&nbsp; In Forza Horizon 6: <b>Settings → HUD and Gameplay → Data Out</b> "
+                "— set it <b>On</b>.<br>"
+                "2.&nbsp; Set Data Out IP <b>127.0.0.1</b> and Port <b>5607</b>.<br>"
+                "3.&nbsp; Run the game <b>Borderless</b> (fullscreen-windowed) so the overlay "
+                "can sit on top.<br>"
+                "4.&nbsp; Drive for a few seconds, then press <b>▶ START TUNING</b> above. "
+                "It only reads the game — you type the values in yourself.")
+            body.setObjectName("noteBody")
+            body.setTextFormat(QtCore.Qt.RichText)
+            body.setWordWrap(True)
+            v.addWidget(title)
+            v.addWidget(body)
+            return note
+
+        def _build_dashboard(self):
+            lay = QtWidgets.QVBoxLayout()
+            self.first_run_note = self._build_first_run_note()
+            lay.addWidget(self.first_run_note)
+            strip = QtWidgets.QHBoxLayout()
+            strip.setSpacing(12)
+            tunes_chip, self.stat_tunes = self._stat_chip("tunes")
+            iters_chip, self.stat_iters = self._stat_chip("iterations")
+            time_chip, self.stat_time = self._stat_chip("time spent")
+            for chip in (tunes_chip, iters_chip, time_chip):
+                strip.addWidget(chip, 1)
+            lay.addLayout(strip)
+            self.dash_detail = QtWidgets.QTextEdit()
+            self.dash_detail.setReadOnly(True)
+            lay.addWidget(self.dash_detail, 1)
+            return self._wrap_card(lay)
+
+        def _refresh_dashboard(self):
+            ss = self.ctrl.stats_summary()
+            tt = ss.get("total_time_s")
+            tt_s = f"{tt/3600:.1f} h" if tt else "-"
+            self.stat_tunes.setText(str(ss["total_tunes"]))
+            self.stat_iters.setText(str(ss["total_iterations"]))
+            self.stat_time.setText(tt_s)
+            # the getting-started note is for first run only - hide once a tune exists
+            self.first_run_note.setVisible(ss["total_tunes"] == 0)
+            L = []
+            if ss["best_lap_by_car"]:
+                L.append("Best lap per car:")
+                for car, bl in sorted(ss["best_lap_by_car"].items()):
+                    L.append(f"  {car}: {bl:.2f}s")
+                L.append("")
+            for title, d in (("By car", ss["by_car"]),
+                             ("By discipline", ss["by_discipline"]),
+                             ("By class", ss["by_class"])):
+                if d:
+                    L.append(title + ": " + ", ".join(f"{k} ({v})" for k, v in sorted(d.items())))
+            L.append("")
+            L.append("Recent activity:")
+            for s in ss["recent"]:
+                bl = f"{s['best_lap_s']:.2f}s" if s.get("best_lap_s") else "-"
+                date = (s.get("date") or "")[:16].replace("T", " ")
+                L.append(f"  {date}  {s['car']} | {s['class']} | {s['discipline']} | best {bl}")
+            if not ss["recent"]:
+                L.append("  (none yet - press START TUNING to make your first tune)")
+            self.dash_detail.setPlainText("\n".join(L))
+
+        # ----- Previous Tunes -------------------------------------------
+        def _build_previous(self):
+            lay = QtWidgets.QHBoxLayout()
+            left = QtWidgets.QVBoxLayout()
+            left.setSpacing(12)
+            self.prev_list = QtWidgets.QListWidget()
+            self.prev_list.setAlternatingRowColors(True)
+            self.prev_list.currentRowChanged.connect(self._on_prev_select)
+            left.addWidget(self.prev_list, 1)
+            btns = QtWidgets.QHBoxLayout()
+            btns.setSpacing(12)
+            for label, fn in (("Load / Copy", self._prev_load),
+                              ("Export...", self._prev_export),
+                              ("Open run log", self._prev_open_log)):
+                b = QtWidgets.QPushButton(label)
+                b.clicked.connect(fn)
+                btns.addWidget(b)
+            left.addLayout(btns)
+            lay.addLayout(left, 1)
+            # the value sheet - the only main-window text area in monospace.
+            self.prev_view = QtWidgets.QTextEdit()
+            self.prev_view.setObjectName("valueSheet")
+            self.prev_view.setReadOnly(True)
+            lay.addWidget(self.prev_view, 1)
+            return self._wrap_card(lay)
+
+        def _refresh_previous(self):
+            self._sessions = self.ctrl.previous_tunes()
+            self.prev_list.clear()
+            for s in self._sessions:
+                bl = f"{s['best_lap_s']:.2f}s" if s.get("best_lap_s") else "-"
+                date = (s.get("date") or "")[:10]
+                self.prev_list.addItem(f"{s['car']}  |  {s['class']} {s['discipline']}  "
+                                       f"|  {date}  |  best {bl}")
+            if self._sessions:
+                self.prev_list.setCurrentRow(0)
+            else:
+                self.prev_view.setPlainText("No saved tunes yet.")
+
+        def _selected_session(self):
+            i = self.prev_list.currentRow()
+            if 0 <= i < len(getattr(self, "_sessions", [])):
+                return self._sessions[i]
+            return None
+
+        def _on_prev_select(self, *_):
+            s = self._selected_session()
+            if not s:
+                return
+            txt = s.get("final_txt")
+            if txt and os.path.exists(txt):
+                try:
+                    self.prev_view.setPlainText(open(txt, encoding="utf-8").read())
+                    return
+                except OSError:
+                    pass
+            self.prev_view.setPlainText("(tune sheet not found on disk)")
+
+        def _prev_load(self):
+            s = self._selected_session()
+            if not s:
+                return
+            QtWidgets.QApplication.clipboard().setText(self.prev_view.toPlainText())
+            self._toast("Tune copied to clipboard.")
+
+        def _prev_export(self):
+            s = self._selected_session()
+            if not s:
+                return
+            dest = QtWidgets.QFileDialog.getExistingDirectory(self, "Export tune files to...")
+            if not dest:
+                return
+            n = 0
+            for key in ("final_txt", "tune_json", "session_json"):
+                p = s.get(key)
+                if p and os.path.exists(p):
+                    try:
+                        shutil.copy(p, dest)
+                        n += 1
+                    except OSError:
+                        pass
+            self._toast(f"Exported {n} file(s) to {dest}.")
+
+        def _prev_open_log(self):
+            s = self._selected_session()
+            if s:
+                _open_path(s.get("session_json"))
+
+        # ----- Logs ------------------------------------------------------
+        def _build_logs(self):
+            lay = QtWidgets.QVBoxLayout()
+            intro = QtWidgets.QLabel(
+                "Diagnostics and exports. The support bundle is one zip you can send "
+                "for help (run JSON + final tune + recent app.log + Heat frames + env).")
+            intro.setWordWrap(True)
+            lay.addWidget(intro)
+            for label, fn in (("Write support bundle (zip)", self._write_bundle),
+                              ("Export cumulative tune log", self._export_cumulative),
+                              ("Open tunes folder", lambda: _open_path(self._tunes_dir())),
+                              ("Open captures folder", lambda: _open_path(self._captures_dir())),
+                              ("Open log file", self._open_app_log)):
+                b = QtWidgets.QPushButton(label)
+                b.setMinimumHeight(32)
+                b.clicked.connect(fn)
+                lay.addWidget(b)
+            lay.addStretch(1)
+            self.logs_status = QtWidgets.QLabel("")
+            self.logs_status.setObjectName("muted")
+            lay.addWidget(self.logs_status)
+            return self._wrap_card(lay)
+
+        def _tunes_dir(self):
+            from ..state import store
+            return store.SESSIONS_DIR
+
+        def _captures_dir(self):
+            return self.hooks.get("captures_dir", lambda: "captures")()
+
+        def _write_bundle(self):
+            fn = self.hooks.get("support_bundle")
+            path = fn() if fn else None
+            self.logs_status.setText(f"Support bundle: {path}" if path else "Bundle failed.")
+
+        def _export_cumulative(self):
+            src = os.path.join(self._tunes_dir(), "cumulative_tune_log.md")
+            if not os.path.exists(src):
+                self.logs_status.setText("No cumulative log yet.")
+                return
+            dest, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save cumulative log", "cumulative_tune_log.md", "Markdown (*.md)")
+            if dest:
+                try:
+                    shutil.copy(src, dest)
+                    self.logs_status.setText(f"Saved {dest}")
+                except OSError as e:
+                    self.logs_status.setText(f"Save failed: {e}")
+
+        def _open_app_log(self):
+            _open_path(self.hooks.get("app_log"))
+
+        # ----- Settings --------------------------------------------------
+        def _build_settings(self):
+            lay = QtWidgets.QVBoxLayout()
+
+            form = QtWidgets.QFormLayout()
+            self.set_port = QtWidgets.QSpinBox()
+            self.set_port.setRange(1, 65535)
+            self.set_port.setValue(int(getattr(self.ctrl, "port", 5607)))
+            self.set_port.valueChanged.connect(
+                lambda v: setattr(self.ctrl, "port", int(v)))
+            form.addRow("Telemetry port (applies next start)", self.set_port)
+
+            self.set_temp = QtWidgets.QComboBox()
+            self.set_temp.addItems(["auto", "manual"])
+            self.set_temp.setCurrentText(getattr(self.ctrl, "temp_mode", "auto"))
+            self.set_temp.currentTextChanged.connect(
+                lambda t: setattr(self.ctrl, "temp_mode", t))
+            form.addRow("Tyre-temp reader", self.set_temp)
+
+            self.set_vision = QtWidgets.QCheckBox("Use Anthropic vision API if a key is set")
+            self.set_vision.setChecked(bool(getattr(self.ctrl, "use_vision_api", False)))
+            self.set_vision.toggled.connect(
+                lambda b: setattr(self.ctrl, "use_vision_api", bool(b)))
+            form.addRow("Cloud reader (optional)", self.set_vision)
+
+            self.set_view = QtWidgets.QComboBox()
+            self.set_view.addItems(["simple", "advanced"])
+            self.set_view.setCurrentText(getattr(self.ctrl, "view_mode", "simple"))
+            self.set_view.currentTextChanged.connect(self.ctrl.set_view_mode)
+            form.addRow("Overlay default view", self.set_view)
+            lay.addLayout(form)
+
+            hdr = QtWidgets.QHBoxLayout()
+            hdr.addWidget(QtWidgets.QLabel("<b>Saved car names</b> (edit or forget)"))
+            hdr.addStretch(1)
+            import_b = QtWidgets.QPushButton("Import car names...")
+            import_b.clicked.connect(self._import_names)
+            hdr.addWidget(import_b)
+            lay.addLayout(hdr)
+            self.names_table = QtWidgets.QTableWidget(0, 2)
+            self.names_table.setHorizontalHeaderLabels(["Ordinal", "Name"])
+            self.names_table.horizontalHeader().setStretchLastSection(True)
+            self.names_table.verticalHeader().setVisible(False)
+            self.names_table.verticalHeader().setDefaultSectionSize(28)
+            self.names_table.setAlternatingRowColors(True)
+            lay.addWidget(self.names_table, 1)
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(12)
+            save_b = QtWidgets.QPushButton("Save name")
+            save_b.clicked.connect(self._save_name)
+            forget_b = QtWidgets.QPushButton("Forget selected")
+            forget_b.setObjectName("danger")
+            forget_b.clicked.connect(self._forget_name)
+            row.addWidget(save_b)
+            row.addWidget(forget_b)
+            row.addStretch(1)
+            lay.addLayout(row)
+            return self._wrap_card(lay)
+
+        def _import_names(self):
+            from . import import_dialog
+            try:
+                s = import_dialog.show_import_dialog(self)
+            except Exception as e:
+                self._toast(f"Import failed: {e}")
+                return
+            self._refresh_settings()
+            if s and s.get("parsed"):
+                self._toast(f"Imported {s['imported']} new name(s); kept {s['already']} "
+                            f"yours; {s['malformed']} skipped.")
+
+        def _refresh_settings(self):
+            sv = self.ctrl.settings_view()
+            self.names_table.setRowCount(0)
+            for c in sv.get("car_names", []):
+                r = self.names_table.rowCount()
+                self.names_table.insertRow(r)
+                ord_item = QtWidgets.QTableWidgetItem(str(c["ordinal"]))
+                ord_item.setFlags(ord_item.flags() & ~QtCore.Qt.ItemIsEditable)
+                self.names_table.setItem(r, 0, ord_item)
+                self.names_table.setItem(r, 1, QtWidgets.QTableWidgetItem(c["name"]))
+
+        def _save_name(self):
+            r = self.names_table.currentRow()
+            if r < 0:
+                return
+            try:
+                ordinal = int(self.names_table.item(r, 0).text())
+            except (TypeError, ValueError):
+                return
+            name = self.names_table.item(r, 1).text() if self.names_table.item(r, 1) else ""
+            self.ctrl.rename_car(ordinal, name)
+            self._toast(f"Saved #{ordinal} -> {name}")
+
+        def _forget_name(self):
+            r = self.names_table.currentRow()
+            if r < 0:
+                return
+            try:
+                ordinal = int(self.names_table.item(r, 0).text())
+            except (TypeError, ValueError):
+                return
+            self.ctrl.forget_car(ordinal)
+            self._refresh_settings()
+
+        # ----- Help ------------------------------------------------------
+        def _build_help(self):
+            lay = QtWidgets.QVBoxLayout()
+            view = QtWidgets.QTextBrowser()
+            view.setOpenExternalLinks(True)   # any links open in the system browser
+            # comfortable line height + themed headings/tables for the rich guide
+            view.document().setDefaultStyleSheet(
+                "h2{color:#e6eaed;font-size:18px;margin:0 0 6px;}"
+                "h3{color:#2fb24c;font-size:14px;margin:16px 0 4px;}"
+                "p,li{color:#e6eaed;line-height:150%;}"
+                "b{color:#e6eaed;}"
+                "td{padding:3px 14px 3px 0;color:#e6eaed;}")
+            view.setHtml(_HELP_HTML)
+            lay.addWidget(view)
+            return self._wrap_card(lay)
+
+        # ----- shared ----------------------------------------------------
+        def refresh(self):
+            try:
+                self._refresh_dashboard()
+                self._refresh_previous()
+                self._refresh_settings()
+            except Exception:
+                pass
+
+        def _toast(self, msg: str):
+            self.status_lbl.setText(msg)
+
+        def _start_tuning(self):
+            fn = self.hooks.get("start_tuning")
+            if fn:
+                fn()
+
+        def closeEvent(self, ev):
+            # closing hides to the tray; the app keeps running (telemetry + overlay
+            # stay alive). Only the tray Quit action actually exits.
+            ev.ignore()
+            self.hide()
+            notify = self.hooks.get("on_hidden")
+            if notify:
+                notify()
+
+    return MainWindow()

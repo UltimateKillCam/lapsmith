@@ -1,0 +1,24 @@
+# GUI dev-run dependencies (Stage 2 overlay app). Install with:
+#   pip install -r requirements-gui.txt
+# The CLI does NOT need any of these.
+PySide6>=6.6.0       # transparent always-on-top non-activating overlay
+keyboard>=0.13.5     # global hotkeys (advance loop / mark segment, no alt-tab)
+fastapi>=0.110.0     # optional LAN view (--web)
+uvicorn>=0.27.0      # ASGI server for the LAN view
+
+# Tyre-temp reading -- PRIMARY is a bundled LOCAL deep-learning OCR. No API key,
+# no network. RapidOCR = PP-OCR ONNX models on onnxruntime (CPU, ~tens of MB,
+# Apache-2.0). Detects + recognizes text anywhere in the frame, so it is
+# resolution / aspect / HUD-scale independent (no fixed pixel boxes).
+rapidocr-onnxruntime>=1.3.0   # PRIMARY local OCR (bundles PP-OCR models)
+onnxruntime>=1.16.0           # CPU inference backend for RapidOCR
+Pillow>=10.0.0                # image loading / downscale
+mss>=9.0.0                    # fast screenshots (peak-load Heat capture)
+
+# FALLBACK only (16:9 best-effort), used if RapidOCR is unavailable:
+pytesseract>=0.3.10  # needs the Tesseract BINARY on PATH (UB-Mannheim build)
+
+# OPTIONAL, opt-in cloud reader (OFF by default). The standalone build works
+# fully offline with no key; enable only if you set ANTHROPIC_API_KEY and tick
+# the box in setup. Model defaults to claude-opus-4-8 (FH6_VISION_MODEL to override).
+anthropic>=0.69.0    # optional Anthropic vision API reader

@@ -1,0 +1,25 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Build / packaging output
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Claude Code config (do not publish)
+.claude/
+
+# Runtime data (lives in %APPDATA%\LapSmith at runtime; ignore any local copies)
+captures/
+sessions/
+*.log
+
+# Runtime OCR model cache (RapidOCR / onnxruntime)
+*.onnx.cache
+.rapidocr/
+**/onnx_cache/

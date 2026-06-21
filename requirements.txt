@@ -1,0 +1,17 @@
+# Core CLI runtime is stdlib-only (socket, struct). The rest are optional.
+mss>=9.0.0          # fast screenshots (preferred)
+pyautogui>=0.9.54  # screenshot fallback
+rich>=13.0.0        # nicer console output (optional)
+pytesseract>=0.3.10 # OCR of the in-game Heat (tyre-temp) page
+Pillow>=10.0.0      # image loading for OCR
+
+# --- GUI overlay app (Stage 2): only needed for `python -m lapsmith.gui` ---
+PySide6>=6.6.0      # transparent always-on-top non-activating overlay
+keyboard>=0.13.5    # global hotkeys (advance loop / mark segment without alt-tab)
+fastapi>=0.110.0    # optional LAN view (--web)
+uvicorn>=0.27.0     # ASGI server for the LAN view
+
+# NOTE: pytesseract needs the Tesseract-OCR *binary*. For the CLI, install it and
+# add it to PATH (https://github.com/UB-Mannheim/tesseract/wiki). The packaged GUI
+# exe BUNDLES Tesseract (see packaging/README_PACKAGING.md) so OCR is zero-setup.
+# Without it, tyre-temp reading falls back to manual entry (--manual-vision).
