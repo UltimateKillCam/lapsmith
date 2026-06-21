@@ -23,12 +23,20 @@ PRESSURE_MIN, PRESSURE_MAX = 25.0, 34.0     # road band
 GREASY_COMBINED_SLIP = 1.0   # combined slip above this on a hot axle = greasy
 COLD_COMBINED_SLIP = 0.3
 # B. ride height / springs / bump
-BOTTOM_THRESH = 0.05      # normalized susp travel <= this = bottoming
+BOTTOM_THRESH = 0.05      # normalized susp travel <= this = bottoming (road/tarmac)
+# Dirt/CC cars sit and travel low; some bottoming is expected and acceptable, so a
+# LOWER threshold there means we only chase genuinely severe bottoming, not forever.
+BOTTOM_THRESH_DIRT = 0.02
 STIFF_THRESH = 0.55       # never drops below this = under-using travel
-RIDE_STEP = 1.0           # cm
-BUMP_STEP = 1.0
-BUMP_SOFTEN_STEP = 0.5
+RIDE_STEP = 1.5           # cm  (was 1.0 - too timid; convergence was glacial)
+BUMP_STEP = 2.0           # was 1.0
+BUMP_SOFTEN_STEP = 1.0    # was 0.5
 BUMP_CAP = 20.0           # stiffest bump we'll dial in before escalating to springs
+# Anti-fixation: max consecutive iterations the loop may spend on ONE axle's
+# bottoming remedy before locking it, accepting the residual, and moving on.
+BOTTOMING_CAP = 2
+# change aggressiveness -> step multiplier for the iterative search levers
+STEP_MULT = {"fine": 0.5, "normal": 1.0, "coarse": 2.0}
 # C. camber (from tyre-temp screenshot inner/mid/outer)
 CAMBER_C = 5.0            # inner-outer delta (deg C) tolerance band
 CAMBER_STEP = 0.2         # deg
@@ -67,6 +75,7 @@ class Recommendation:
     feel_for: str
     detail: str = ""
     kind: str = "search"          # "evidence" (own measurement) | "search" (lap-time tuned)
+    symptom: str = ""             # e.g. "bottoming_front" - lets the loop cap fixation
 
     def is_change(self) -> bool:
         return bool(self.fields)
@@ -122,6 +131,12 @@ def analyze(stats: TestStats, tune: Tune, discipline: str,
     return CONVERGED
 
 
+# --- aggressiveness ----------------------------------------------------------
+def step_mult_for(aggressiveness: str) -> float:
+    """fine/normal/coarse -> step multiplier for the iterative search levers."""
+    return STEP_MULT.get(aggressiveness, 1.0)
+
+
 # EVIDENCE-driven groups each have their OWN measurement justifying them, so they
 # can be applied together and confirmed with a single lap. SEARCH-driven groups
 # (the handling cluster: ARBs, damping, fine springs) are tuned only by lap time
@@ -140,10 +155,17 @@ def analyze_batch(stats: TestStats, tune: Tune, discipline: str,
                   converged: Optional[set] = None,
                   limits: Optional[CarLimits] = None,
                   ride_locked: Optional[set] = None,
-                  max_search: int = 1) -> List[Recommendation]:
+                  max_search: int = 1,
+                  bottoming_locked: Optional[set] = None,
+                  step_mult: float = 1.0,
+                  bottoming_attempts: Optional[dict] = None) -> List[Recommendation]:
     """Build a BATCH for one test lap: ALL firing evidence-driven changes (each
     justified by its own measurement) plus up to `max_search` search-driven
     (handling-cluster) changes. Returns [] if nothing fires.
+
+    `bottoming_locked` axles are skipped by the ride rule (anti-fixation cap / gate
+    revert); `step_mult` scales the iterative search-lever steps (aggressiveness);
+    `bottoming_attempts` per-axle escalates the bottoming step on repeats.
 
     Evaluation runs against a working copy so two rules can't both grab the same
     lever (e.g. ride-height bottoming bump vs damping-softening bump)."""
@@ -159,7 +181,11 @@ def analyze_batch(stats: TestStats, tune: Tune, discipline: str,
                  _rule_gearing, _rule_aero, _rule_arb, _rule_damping,
                  _rule_camber_search):
         if rule is _rule_ride:
-            rec = _rule_ride(stats, work, discipline, tyre_reading, road_band, limits, ride_locked)
+            rec = _rule_ride(stats, work, discipline, tyre_reading, road_band, limits,
+                             ride_locked, bottoming_locked, step_mult, bottoming_attempts)
+        elif rule is _rule_camber_search:
+            rec = _rule_camber_search(stats, work, discipline, tyre_reading, road_band,
+                                      limits, step_mult)
         else:
             rec = rule(stats, work, discipline, tyre_reading, road_band, limits)
         if not rec or not rec.is_change() or rec.group in converged:
@@ -256,55 +282,87 @@ def _axle_pressure_grip(combined_slip, avg_temp, cur, lo, hi):
 
 
 # --- B. ride height / springs / bump ---------------------------------------
+def _bottom_thresh(disc: str) -> float:
+    """Bottoming threshold by discipline. Dirt/CC cars run low and bottom a little
+    by design, so a lower threshold means we don't chase acceptable bottoming."""
+    return BOTTOM_THRESH_DIRT if disc in ("dirt", "cc") else BOTTOM_THRESH
+
+
 def _rule_ride(stats, tune, disc, tyre_reading, road_band, limits,
-               ride_locked=None) -> Optional[Recommendation]:
+               ride_locked=None, bottoming_locked=None, step_mult=1.0,
+               bottoming_attempts=None) -> Optional[Recommendation]:
     ride_locked = ride_locked or set()
-    if stats.susp_min_front <= BOTTOM_THRESH:
-        return _bottoming_fix("front", stats.susp_min_front, tune, disc, limits,
-                              "front" in ride_locked)
-    if stats.susp_min_rear <= BOTTOM_THRESH:
-        return _bottoming_fix("rear", stats.susp_min_rear, tune, disc, limits,
-                              "rear" in ride_locked)
+    bottoming_locked = bottoming_locked or set()
+    bottoming_attempts = bottoming_attempts or {}
+    thresh = _bottom_thresh(disc)
+    # Is the car understeering on this run? Stiffening FRONT bump would worsen the
+    # push, so the bottoming remedy avoids it and prefers ride height / spring.
+    understeer = (stats.n_corner_frames >= 10
+                  and (stats.slip_angle_front - stats.slip_angle_rear) > US_DEG)
+    for axle in ("front", "rear"):
+        if axle in bottoming_locked:
+            continue                       # cap hit / gate reverted - leave it be
+        susp_min = stats.susp_min_front if axle == "front" else stats.susp_min_rear
+        if susp_min <= thresh:
+            return _bottoming_fix(axle, susp_min, tune, disc, limits,
+                                  ride_ineffective=(axle in ride_locked),
+                                  understeer=understeer,
+                                  attempts=bottoming_attempts.get(axle, 0),
+                                  step_mult=step_mult, thresh=thresh)
     return None
 
 
-def _bottoming_fix(axle, susp_min, tune, disc, limits, ride_ineffective=False
+def _bottoming_fix(axle, susp_min, tune, disc, limits, ride_ineffective=False,
+                   understeer=False, attempts=0, step_mult=1.0, thresh=BOTTOM_THRESH
                    ) -> Optional[Recommendation]:
-    """Escalate one capped lever at a time: ride height -> bump -> spring.
-    Skip the ride-height step when ride height is at the CAR's max OR raising it
-    stopped reducing bottoming (`ride_ineffective`); then stiffen bump, and if bump
-    is also maxed, the spring."""
+    """Escalate one capped lever at a time: ride height -> bump -> spring. Skip the
+    ride-height step when it's at the CAR's max OR stopped reducing bottoming
+    (`ride_ineffective`). BALANCE-AWARE: with understeer present, avoid stiffening
+    FRONT bump (it adds push) and prefer the spring. Steps scale with the
+    aggressiveness multiplier and escalate with repeated attempts on the axle."""
     label = axle.capitalize()
     rh = f"ride_height_{axle[0]}"     # ride_height_f / ride_height_r
     bp = f"bump_{axle[0]}"
     sp = f"spring_{axle[0]}"
     rh_max = _ride_cap(disc, limits, rh)
+    symptom = f"bottoming_{axle}"
+    mult = step_mult * (1 + max(0, attempts))     # escalate per repeat on this axle
 
     can_raise = (tune.get(rh) < rh_max - 1e-6 and not limits.at_max(rh, tune.get(rh))
                  and not ride_ineffective)
     if can_raise:
-        new = _round(tune.get(rh) + RIDE_STEP)
+        new = _round(tune.get(rh) + RIDE_STEP * mult)
         return Recommendation("ride_height", {rh: new},
-            f"{label} bottoming: min normalized travel {susp_min:.2f} <= {BOTTOM_THRESH}.",
+            f"{label} bottoming: min normalized travel {susp_min:.2f} <= {thresh}.",
             f"No more harsh {label.lower()} crashes over bumps; steadier end.",
-            f"{label} ride height {tune.get(rh):.1f} -> {new:.1f} cm")
+            f"{label} ride height {tune.get(rh):.1f} -> {new:.1f} cm", symptom=symptom)
 
-    # ride height pinned/ineffective -> stiffen bump (up to BUMP_CAP)
-    if tune.get(bp) < BUMP_CAP - 1e-6 and not limits.at_max(bp, tune.get(bp)):
+    # ride pinned. Normally stiffen bump next - BUT with front understeer, front bump
+    # would add push, so skip it and go to the spring instead.
+    avoid_front_bump = (axle == "front" and understeer)
+    if (not avoid_front_bump
+            and tune.get(bp) < BUMP_CAP - 1e-6 and not limits.at_max(bp, tune.get(bp))):
         why = ("raising ride height stopped reducing bottoming" if ride_ineffective
                else f"ride height already at car max ({tune.get(rh):.1f} cm)")
-        new = _round(min(BUMP_CAP, tune.get(bp) + BUMP_STEP))
-        return Recommendation("damping_bump", {bp: new},
+        new = _round(min(BUMP_CAP, tune.get(bp) + BUMP_STEP * mult))
+        rec = Recommendation("damping_bump", {bp: new},
             f"{label} bottoming and {why} - stiffening bump instead of raising ride.",
             f"{label} rides over compressions without packing onto the bump stops.",
-            f"{label} bump {tune.get(bp):.1f} -> {new:.1f}")
+            f"{label} bump {tune.get(bp):.1f} -> {new:.1f}", symptom=symptom)
+        if understeer:    # rear-axle bump touched while the front pushes: note it
+            rec.detail = (rec.detail + "  [balance: stiffer bump can add understeer - "
+                          "the lap-time gate reverts it if it hurts]").strip()
+        return rec
 
-    # bump also maxed -> stiffen the spring
-    new = _round(tune.get(sp) + _spring_step(tune.get(sp)))
-    return Recommendation("springs", {sp: new},
-        f"{label} bottoming with ride height AND bump at their caps - stiffening spring.",
+    # bump maxed (or front bump avoided for balance) -> stiffen the spring
+    new = _round(tune.get(sp) + _spring_step(tune.get(sp)) * mult)
+    reason = (f"{label} bottoming; avoiding front bump (would add understeer) - "
+              "stiffening the spring instead."
+              if avoid_front_bump else
+              f"{label} bottoming with ride height AND bump at their caps - stiffening spring.")
+    return Recommendation("springs", {sp: new}, reason,
         f"{label} resists compression so it stops bottoming.",
-        f"{label} spring {tune.get(sp):.1f} -> {new:.1f} kgf/mm")
+        f"{label} spring {tune.get(sp):.1f} -> {new:.1f} kgf/mm", symptom=symptom)
 
 
 def _spring_step(cur: float) -> float:
@@ -370,7 +428,8 @@ def _camber_for_axle(inner_minus_outer, cur, key, label):
     return None
 
 
-def _rule_camber_search(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[Recommendation]:
+def _rule_camber_search(stats, tune, disc, tyre_reading, road_band, limits,
+                        step_mult=1.0) -> Optional[Recommendation]:
     """No tyre-temp read this lap: tune FRONT camber by LAP-TIME search instead of
     by temps. Hill-climbs toward more negative front camber (the usual corner-grip
     direction); fitness keeps it while it helps and locks it on the first regress.
@@ -381,7 +440,7 @@ def _rule_camber_search(stats, tune, disc, tyre_reading, road_band, limits) -> O
     if not road_band:
         return None            # camber search is a grip lever; skip drift/drag
     cur = tune.camber_f
-    new = _round(cur - CAMBER_STEP)      # more negative front = more corner grip
+    new = _round(cur - CAMBER_STEP * step_mult)   # more negative front = more corner grip
     return Recommendation("camber_search", {"camber_f": new},
         "No tyre-temp read - searching front camber by lap time.",
         "More front grip at full lean (kept only if the lap is faster).",

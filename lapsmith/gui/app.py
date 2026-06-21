@@ -428,7 +428,8 @@ def main(argv=None) -> int:
                              laps_per_test=res["laps_per_test"], lap_agg=res["lap_agg"],
                              temp_mode=res.get("temp_mode"),
                              use_vision_api=res.get("use_vision_api"),
-                             target_class=res.get("target_class"))
+                             target_class=res.get("target_class"),
+                             aggressiveness=res.get("aggressiveness"))
             done_box["bundled"] = False
             log.info("setup applied: %s -> phase=%s",
                      {k: v for k, v in res.items() if k != "limits"}, ctrl.phase)

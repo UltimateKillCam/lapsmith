@@ -20,6 +20,11 @@ from .parser import Packet
 
 # CurrentLap dropping by at least this many seconds = a lap rollover (start line).
 CURRENT_LAP_RESET_DROP = 5.0
+# A finished lap's time must be at least this (seconds). Anything shorter is a
+# reload / restart / telemetry glitch, NOT a real measured lap - no Rivals lap is
+# this short. Used to reject the spurious "completion" a reload's counter-reset
+# would otherwise produce.
+LAP_TIME_FLOOR = 5.0
 
 
 @dataclass
@@ -33,6 +38,10 @@ class LapWatcher:
     def __init__(self):
         self.prev_lap_number: Optional[int] = None
         self.prev_current_lap: Optional[float] = None
+        # LastLap value when the CURRENT open lap began. A genuine lap rollover
+        # refreshes LastLap to a new time; a reload leaves it carried-over, so we
+        # compare against this to tell a finished lap from a restart.
+        self._lap_open_last_lap: Optional[float] = None
         self.buf: List[Packet] = []
         self._seen_live = False
         self._advancing = False        # the lap TIMER is actually running
@@ -42,6 +51,7 @@ class LapWatcher:
     def reset(self):
         self.prev_lap_number = None
         self.prev_current_lap = None
+        self._lap_open_last_lap = None
         self.buf = []
 
     def pop_restarted(self) -> bool:
@@ -84,6 +94,7 @@ class LapWatcher:
             if self.prev_lap_number is None:
                 self.prev_lap_number = p.lap_number
                 self.prev_current_lap = p.current_lap
+                self._lap_open_last_lap = p.last_lap
 
             # lap counter jumped BACKWARDS without a race-off (in-place restart)
             if p.lap_number < self.prev_lap_number:
@@ -91,6 +102,7 @@ class LapWatcher:
                 self.buf = []
                 self.prev_lap_number = p.lap_number
                 self.prev_current_lap = p.current_lap
+                self._lap_open_last_lap = p.last_lap
                 self.buf.append(p)
                 continue
 
@@ -102,13 +114,34 @@ class LapWatcher:
                 self._advancing = True
 
             completed = False
+            reload_reset = False
             if p.lap_number > self.prev_lap_number:
+                # LapNumber incremented: the reliable, unambiguous lap completion.
                 completed = True
             elif (self.prev_current_lap is not None
                   and self.prev_current_lap - p.current_lap > CURRENT_LAP_RESET_DROP
                   and p.lap_number >= self.prev_lap_number):
-                # CurrentLap reset toward 0 across the start line
-                completed = True
+                # CurrentLap jumped back toward 0 WITHOUT a LapNumber increment. A
+                # genuine rollover refreshes LastLap to a new, plausible time; a
+                # RELOAD/restart leaves LastLap at the carried-over pre-reload value
+                # (or 0). Only the former is a finished lap - the latter is a restart
+                # (which the controller treats as "re-arm the out-lap", not "measure").
+                fresh = (p.last_lap > LAP_TIME_FLOOR
+                         and (self._lap_open_last_lap is None
+                              or abs(p.last_lap - self._lap_open_last_lap) > 1e-3))
+                if fresh:
+                    completed = True
+                else:
+                    reload_reset = True
+
+            if reload_reset:
+                self._restarted = True
+                self.buf = []
+                self.prev_lap_number = p.lap_number
+                self.prev_current_lap = p.current_lap
+                self._lap_open_last_lap = p.last_lap
+                self.buf.append(p)
+                continue
 
             if completed:
                 results.append(LapResult(
@@ -117,6 +150,7 @@ class LapWatcher:
                     packets=self.buf))
                 self.buf = []
                 self.prev_lap_number = p.lap_number
+                self._lap_open_last_lap = p.last_lap
 
             self.prev_current_lap = p.current_lap
             self.buf.append(p)

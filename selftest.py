@@ -777,6 +777,85 @@ def test_f8_rivals_autolap():
         ctrl.listener.stop()
 
 
+def test_reload_and_fixation():
+    print("\n== regression: reload not measured (B) + anti-fixation cap (A) ==")
+    from lapsmith.telemetry.laps import LapWatcher, LAP_TIME_FLOOR
+    from lapsmith.gui import controller as C
+    from lapsmith.knowledge import rules
+    from lapsmith.state.tune_state import Tune, CarLimits
+    from lapsmith import identity
+    from lapsmith.telemetry.laps import LapResult
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+
+    # --- B1 watcher: a RELOAD counter-reset is NOT a finished lap ---------------
+    w = LapWatcher()
+    w.feed(_lap_packets(0, 5.0, 0.0, n=2))
+    w.feed(_lap_packets(0, 30.0, 0.0, n=2))      # mid lap-0, timer at 30s
+    w.pop_restarted()                            # clear the "seen live" restart
+    # reload: CurrentLap drops to ~0, LapNumber stays 0, LastLap carried-over (0)
+    res = w.feed(_lap_packets(0, 0.5, 0.0, n=2))
+    check("reload counter-reset emits NO measured lap", len(res) == 0)
+    check("reload counter-reset flags a restart (re-arm out-lap)", w.pop_restarted() is True)
+    # a GENUINE completion (LapNumber++ with a fresh, plausible LastLap) does emit
+    res2 = w.feed(_lap_packets(1, 0.5, 92.3, n=2))
+    check("genuine lap (LapNumber++ + fresh LastLap) emits one measured lap",
+          len(res2) == 1 and abs(res2[0].last_lap_s - 92.3) < 0.01)
+
+    # --- B2 controller: WAITING_FOR_MEASURED_LAP - reload doesn't run the gate ---
+    cb = C.Controller(); cb.identity = ident
+    cb.apply_setup("road", CarLimits()); cb.mode = C.MODE_AUTO
+    cb.best_segment = 60.0; cb._baseline_lap_s = 60.0
+    cb.stats = aggregate(_window("understeer"))
+    cb._compute_batch()
+    cb.change_applied()
+    check("after a change -> WAITING_FOR_MEASURED_LAP [out_lap]",
+          cb._await_state == "out_lap" and cb._awaiting_test and cb._skip_laps == 1)
+    cb._on_lap(LapResult(1, 99.0, _lap_packets(1, 5, 99.0)))   # out-lap, skipped
+    check("out-lap skipped -> [measuring]", cb._await_state == "measuring")
+    prev_best = cb.best_segment
+    cb._on_lap(LapResult(1, 2.0, _lap_packets(1, 2, 2.0)))     # reload-short lap
+    check("reload-short lap (<= floor) is NOT measured; gate did not run",
+          cb.best_segment == prev_best and cb._awaiting_test and cb._await_state == "measuring")
+    check("reload re-armed the out-lap", cb._skip_laps >= 1)
+    check("LAP_TIME_FLOOR guards short laps", LAP_TIME_FLOOR >= 5.0 and 2.0 <= LAP_TIME_FLOOR)
+    cb._skip_laps = 0
+    cb._on_lap(LapResult(2, 58.0, _lap_packets(2, 5, 58.0)))   # real lap -> gate
+    check("a real measured lap runs the gate (waiting state cleared)",
+          cb._await_state is None and not cb._awaiting_test)
+
+    # --- A1 anti-fixation cap: bottoming front locks after the cap, moves on -----
+    ca = C.Controller(); ca.identity = ident
+    ca.apply_setup("road", CarLimits(), aggressiveness="normal"); ca.mode = C.MODE_AUTO
+    ca.best_segment = 60.0
+    ca.stats = aggregate(_window("front_bottoming"))
+    ca._compute_batch()
+    check("bottoming_front fires (attempt 1)",
+          any(getattr(r, "symptom", "") == "bottoming_front" for r in ca.batch)
+          and ca._bottoming_attempts.get("front") == 1)
+    ca._compute_batch()
+    check(f"bottoming_front hits cap ({rules.BOTTOMING_CAP}) and LOCKS the axle",
+          ca._bottoming_attempts.get("front") == rules.BOTTOMING_CAP
+          and "front" in ca._bottoming_locked)
+    ca._compute_batch()
+    check("after the cap, the loop stops re-firing front bottoming (moves on)",
+          not any(getattr(r, "symptom", "") == "bottoming_front" for r in ca.batch))
+
+    # --- A3 balance-aware bottoming + dirt tolerance + A2 aggressiveness ---------
+    check("dirt bottoming threshold looser than road",
+          rules._bottom_thresh("dirt") < rules._bottom_thresh("road"))
+    t = Tune(); t.bump_f = 5.0; t.spring_f = 80.0
+    rec_us = rules._bottoming_fix("front", 0.01, t, "road", CarLimits(),
+                                  ride_ineffective=True, understeer=True)
+    rec_ok = rules._bottoming_fix("front", 0.01, t, "road", CarLimits(),
+                                  ride_ineffective=True, understeer=False)
+    check("understeer + front bottoming -> SPRING (avoids front bump)",
+          rec_us.group == "springs")
+    check("no understeer + front bottoming (ride pinned) -> BUMP",
+          rec_ok.group == "damping_bump")
+    check("aggressiveness: coarse > normal > fine step multiplier",
+          rules.step_mult_for("coarse") > rules.step_mult_for("normal") > rules.step_mult_for("fine"))
+
+
 def test_batch_changes():
     print("\n== batch changes (evidence together, search rate-limited, batch revert) ==")
     from lapsmith.gui import controller as C
@@ -1660,6 +1739,7 @@ if __name__ == "__main__":
     test_fitness_resolution()
     test_auto_lap()
     test_f8_rivals_autolap()
+    test_reload_and_fixation()
     test_batch_changes()
     test_multi_lap_fitness()
     test_lateral_capture_axis()

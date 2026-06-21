@@ -29,7 +29,7 @@ from ..knowledge.baseline import build_baseline, format_checklist
 from ..knowledge import rules
 from ..state.tune_state import Tune, TuneState, CarLimits
 from ..state import store
-from ..telemetry.laps import LapWatcher, LapResult
+from ..telemetry.laps import LapWatcher, LapResult, LAP_TIME_FLOOR
 
 LOAD_MIN_G = HIGH_G_THRESHOLD
 RIDE_IMPROVE_MARGIN = 0.02
@@ -101,6 +101,12 @@ class Controller:
     _skip_laps: int = 0               # ignore N upcoming lap completions (warm-up/out-laps)
     _restart_count: int = 0           # event restarts detected (diagnostic)
     _awaiting_test: bool = False      # a change was applied; next full lap is its test
+    # explicit WAITING_FOR_MEASURED_LAP sub-state after a change: None | "out_lap"
+    # (waiting for the out-lap to pass) | "measuring" (timing the clean lap). A
+    # reload/spurious lap or another F8 does NOT advance while this is set.
+    _await_state: Optional[str] = None
+    _pre_change_last_lap: Optional[float] = None   # carried-over LastLap to reject
+    _await_dbg: tuple = ()            # dedup for the per-tick waiting log
     last_lap_s: Optional[float] = None
     lap_number: int = 0
     # multi-lap fitness (single laps are too noisy)
@@ -119,6 +125,15 @@ class Controller:
 
     ride_locked: set = field(default_factory=set)
     _last_ride_change: Optional[dict] = None
+    # anti-fixation: per-axle bottoming attempt counts, axles whose bottoming remedy
+    # is LOCKED (cap hit, or the gate reverted it), and the same-symptom streak.
+    _bottoming_attempts: dict = field(default_factory=dict)
+    _bottoming_locked: set = field(default_factory=set)
+    _cur_bottoming_axles: set = field(default_factory=set)   # this batch's bottoming axles
+    _last_symptom: Optional[str] = None
+    _symptom_streak: int = 0
+    # change aggressiveness -> step multiplier (fine 0.5 / normal 1.0 / coarse 2.0).
+    aggressiveness: str = "normal"
     stale: int = 0
     export: Optional[dict] = None       # paths to the shareable files (set at finish)
     started_iso: str = ""
@@ -228,6 +243,9 @@ class Controller:
         self._skip_laps = 0
         self._restart_count = 0
         self._awaiting_test = False
+        self._await_state = None
+        self._pre_change_last_lap = None
+        self._await_dbg = ()
         self.stale = 0
         self.export = None
         self.batch = []
@@ -237,6 +255,10 @@ class Controller:
         self.last_reader = None
         self.ride_locked = set()
         self._last_ride_change = None
+        self._bottoming_attempts = {}
+        self._bottoming_locked = set()
+        self._last_symptom = None
+        self._symptom_streak = 0
         self.error = None
         self.started_iso = _dt.datetime.now().isoformat(timespec="seconds")
 
@@ -263,8 +285,11 @@ class Controller:
                     laps_per_test: object = None, lap_agg: Optional[str] = None,
                     temp_mode: Optional[str] = None,
                     use_vision_api: Optional[bool] = None,
-                    target_class: Optional[str] = None):
+                    target_class: Optional[str] = None,
+                    aggressiveness: Optional[str] = None):
         self.discipline = discipline
+        if aggressiveness in ("fine", "normal", "coarse"):
+            self.aggressiveness = aggressiveness
         self.limits = limits or CarLimits()
         if temp_mode in ("auto", "manual"):
             self.temp_mode = temp_mode
@@ -367,16 +392,33 @@ class Controller:
                 _laplog.info("MODE TRANSITION detecting -> AUTO (lap timer advancing)")
                 self.log("AUTO-LAP engaged - lap timer is live. Each completed lap is "
                          "captured automatically.")
-            # an event RESTART (race off->on, or lap counter reset) re-arms the
-            # warm-up discard so lap 1 of the fresh standing start is ignored.
+            # an event RESTART (race off->on, lap counter reset, or a reload's
+            # CurrentLap-reset) re-arms the warm-up discard so lap 1 of the fresh
+            # standing start is ignored - never mistaken for the measured lap.
             if self._watcher.pop_restarted() and self.mode == MODE_AUTO:
                 self.arm_next_lap()
-                self._reset_test()
+                self._reset_test()         # discard any partial measurement on this run
                 self._restart_count += 1
+                if self._await_state is not None:
+                    self._await_state = "out_lap"   # back to waiting for a clean lap
+                _laplog.info("RESTART/reload detected -> re-arming out-lap (skip_laps=%d, "
+                             "await=%s). The reset is NOT counted as a measured lap.",
+                             self._skip_laps, self._await_state)
                 self.log("Event restart detected - discarding the warm-up lap; the "
                          "next FULL lap is measured.")
             if self.mode != MODE_AUTO:
                 return
+            # per-tick instrumentation while WAITING_FOR_MEASURED_LAP (deduped)
+            if self._await_state is not None and pkts:
+                last = pkts[-1]
+                dbg = (last.lap_number, round(last.current_lap, 1), self._skip_laps,
+                       self._await_state)
+                if dbg != self._await_dbg:
+                    self._await_dbg = dbg
+                    _laplog.info("WAITING_FOR_MEASURED_LAP[%s] tick: prevLap=%s curLap=%s "
+                                 "curCur=%.1f skip_laps=%d completed=%d",
+                                 self._await_state, prev_lap, last.lap_number,
+                                 last.current_lap, self._skip_laps, len(laps))
             for lap in laps:
                 self._on_lap(lap)
                 if self.phase != DRIVE_AUTO:
@@ -388,14 +430,38 @@ class Controller:
     def _on_lap(self, lap: "LapResult"):
         self.lap_number = lap.lap_number
         self.last_lap_s = lap.last_lap_s
+        waiting = self._await_state is not None
+        # 1) the out-lap on a fresh tune is never measured
         if self._skip_laps > 0:
             self._skip_laps -= 1
+            if waiting and self._skip_laps == 0:
+                self._await_state = "measuring"
+            _laplog.info("WAITING_FOR_MEASURED_LAP[%s]: out-lap [lap %s, %.2fs] skipped; "
+                         "skip_laps now %d - drive a clean lap.",
+                         self._await_state, lap.lap_number, lap.last_lap_s, self._skip_laps)
             self.log(f"[lap {lap.lap_number}] warm-up/out-lap ignored "
                      f"({lap.last_lap_s:.2f}s) - drive the next full lap.")
             return
-        if lap.last_lap_s <= 0:
-            self.log(f"[lap {lap.lap_number}] no valid LastLap - skipped.")
+        # 2) reject an implausibly short "lap" - a reload/restart counter-reset, not
+        #    a measured lap. Re-arm the out-lap; do NOT run the gate.
+        if lap.last_lap_s <= LAP_TIME_FLOOR:
+            _laplog.info("WAITING_FOR_MEASURED_LAP[%s]: REJECTED lap %s (LastLap %.2fs <= floor "
+                         "%.1fs) - reload/glitch, not a measured lap; re-arming the out-lap.",
+                         self._await_state, lap.lap_number, lap.last_lap_s, LAP_TIME_FLOOR)
+            if waiting:
+                self.arm_next_lap()
             return
+        # 3) reject the carried-over pre-reload LastLap (not refreshed by a new lap)
+        if waiting and self._pre_change_last_lap is not None \
+                and abs(lap.last_lap_s - self._pre_change_last_lap) < 1e-3:
+            _laplog.info("WAITING_FOR_MEASURED_LAP[%s]: REJECTED lap %s (LastLap %.2fs == "
+                         "carried-over pre-reload value) - not a fresh lap; re-arming out-lap.",
+                         self._await_state, lap.lap_number, lap.last_lap_s)
+            self.arm_next_lap()
+            return
+        if waiting:
+            _laplog.info("WAITING_FOR_MEASURED_LAP[measuring]: ACCEPTED measured lap %s = "
+                         "%.2fs - collecting for the fitness gate.", lap.lap_number, lap.last_lap_s)
         self._collect_lap(lap)
 
     def _target_laps(self) -> int:
@@ -440,8 +506,13 @@ class Controller:
         _laplog.info("test finalized: laps=%s -> %s %.2fs noise %.2fs",
                      [round(x, 2) for x in laps], self.lap_agg, test_time, noise)
         if self._awaiting_test:
+            _laplog.info("WAITING_FOR_MEASURED_LAP -> GATE: measured %.2fs vs best %s; "
+                         "running keep/revert fitness now.", test_time,
+                         f"{self.best_segment:.2f}" if self.best_segment else "n/a")
             self._apply_fitness_multi(test_time, noise)
             self._awaiting_test = False
+            self._await_state = None
+            self._pre_change_last_lap = None
         elif self.best_segment is None:
             self.best_segment = test_time
             self._baseline_lap_s = test_time
@@ -494,6 +565,20 @@ class Controller:
             self.stale += 1
             self.log(f"[fitness] batch ({n}) {delta:+.2f}s within noise {noise:.2f} - "
                      "INCONCLUSIVE, holding the change (kept, not locked).")
+        # anti-fixation (gate is the final authority): a bottoming change that
+        # regressed OR didn't clearly improve the lap -> lock that axle's bottoming
+        # remedy so the rule stops re-firing on it (accept the residual, move on).
+        improved = delta < -gate
+        if not improved:
+            for axle in self._cur_bottoming_axles:
+                if axle not in self._bottoming_locked:
+                    self._bottoming_locked.add(axle)
+                    _laplog.info("ANTI-FIXATION: %s bottoming change did not improve the lap "
+                                 "(%+.2fs) - GATE locking the axle; stop re-firing that rule.",
+                                 axle, delta)
+                    self.log(f"[anti-fixation] {axle} bottoming change didn't help "
+                             f"({delta:+.2f}s) - locked; moving to other levers.")
+        self._cur_bottoming_axles = set()
         self._last_improvement = best - test_time
         self._applied_records = []
         self.state.iteration += 1
@@ -501,6 +586,36 @@ class Controller:
     def _read_lap_heat(self):
         path, g, udp = (self.lap_heat_fn() if self.lap_heat_fn else (None, 0.0, None))
         self._read_heat(path, g, udp_temps=udp)
+
+    def _track_fixation(self):
+        """Anti-fixation: count CONSECUTIVE iterations spent on each axle's
+        bottoming remedy. At the cap, LOCK that axle's bottoming so the loop stops
+        piling onto one lever and the next rule runs instead. Records this batch's
+        bottoming axles so the fitness gate can also lock on a regression."""
+        symptoms = {r.symptom for r in self.batch if getattr(r, "symptom", "")}
+        primary = next((s for s in symptoms if s.startswith("bottoming_")), None)
+        if primary and primary == self._last_symptom:
+            self._symptom_streak += 1
+        else:
+            self._symptom_streak = 1 if primary else 0
+            self._last_symptom = primary
+        self._cur_bottoming_axles = set()
+        for axle in ("front", "rear"):
+            if f"bottoming_{axle}" in symptoms:
+                self._cur_bottoming_axles.add(axle)
+                self._bottoming_attempts[axle] = self._bottoming_attempts.get(axle, 0) + 1
+                if (self._bottoming_attempts[axle] >= rules.BOTTOMING_CAP
+                        and axle not in self._bottoming_locked):
+                    self._bottoming_locked.add(axle)
+                    _laplog.info("ANTI-FIXATION: %s bottoming hit the cap (%d consecutive "
+                                 "attempts) - LOCKING the axle's bottoming remedy; the loop "
+                                 "moves to the next rule instead of stiffening bump again.",
+                                 axle, self._bottoming_attempts[axle])
+                    self.log(f"[anti-fixation] {axle} bottoming capped at "
+                             f"{rules.BOTTOMING_CAP} attempts - accepting the residual and "
+                             "moving to the next lever.")
+            else:
+                self._bottoming_attempts[axle] = 0     # streak broken -> reset
 
     # ---- shared helpers (both modes) ------------------------------------
     def _consume_ride_progress(self):
@@ -657,7 +772,10 @@ class Controller:
         self.batch = rules.analyze_batch(
             self.stats, self.state.current, self.discipline, self.tyre_reading,
             converged=self.state.converged_levers, limits=self.limits,
-            ride_locked=self.ride_locked, max_search=self.changes_per_test)
+            ride_locked=self.ride_locked, max_search=self.changes_per_test,
+            bottoming_locked=self._bottoming_locked,
+            step_mult=rules.step_mult_for(self.aggressiveness),
+            bottoming_attempts=self._bottoming_attempts)
         if not self.batch:
             if self.stale >= 2 or self.best_segment is None:
                 self.phase = DONE
@@ -667,6 +785,7 @@ class Controller:
             self.log("No rule fired; one more lap/run to confirm.")
             self.phase = self._drive_phase()
             return
+        self._track_fixation()        # anti-fixation: count + cap same-axle bottoming
         # remember a ride-height raise so the next lap can check it helped
         for rec in self.batch:
             if rec.group == "ride_height":
@@ -697,10 +816,16 @@ class Controller:
             self._applied_records.append(applied)
         if self.mode == MODE_AUTO:
             self._awaiting_test = True
+            self._await_state = "out_lap"
+            self._pre_change_last_lap = self.last_lap_s   # carried-over value to reject
             self.arm_next_lap()        # ignore the partial out-lap on the new tune
             self.phase = DRIVE_AUTO
-            self.log(f"Applied {len(self.batch)} change(s) - ignoring the out-lap; the next "
-                     "COMPLETE lap measures the batch.")
+            _laplog.info("WAITING_FOR_MEASURED_LAP entered [out_lap]: %d change(s) applied; "
+                         "skip_laps=%d, carried-over LastLap=%.2f. A reload/restart re-arms "
+                         "the out-lap; only a fresh full green lap is measured.",
+                         len(self.batch), self._skip_laps, self.last_lap_s or 0.0)
+            self.log(f"Applied {len(self.batch)} change(s). RESTART the Rivals event, then drive "
+                     "a clean lap - the out-lap is ignored; the next FULL lap is measured.")
         else:
             self.phase = CHANGE_TIME
 
@@ -834,9 +959,13 @@ class Controller:
                                "Drive a lap with the Heat page up - auto-lap starts when "
                                "the lap timer moves. (Free-roam? Press [F9] to mark a segment.)")
             if self._awaiting_test:
+                if self._await_state == "out_lap":
+                    return self._g(5, "Test laps",
+                                   "Out-lap - drive a clean lap. The lap right after a change "
+                                   "(and any reload) is ignored; the next FULL lap is measured.")
                 return self._g(5, "Test laps",
-                               "Drive 2 laps after the restart: lap 1 is a warm-up (ignored), "
-                               "lap 2 is timed and compared to your best.")
+                               "Measuring... drive a clean lap; it's timed and compared to "
+                               "your best, then the next change appears.")
             if self.best_segment is None:
                 return self._g(3, "Baseline laps",
                                "Drive 2 laps: lap 1 is a warm-up (ignored), lap 2 is your "

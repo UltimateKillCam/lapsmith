@@ -87,6 +87,10 @@ def show_setup_dialog(detected_summary: str = "",
     agg = QtWidgets.QComboBox()
     agg.addItems(["Best of N", "Median of N"])
     form.addRow("Lap aggregate", agg)
+    aggro = QtWidgets.QComboBox()
+    aggro.addItems(["Fine (small steps)", "Normal", "Coarse (big steps)"])
+    aggro.setCurrentIndex(1)        # Normal
+    form.addRow("Change aggressiveness", aggro)
 
     tmode = QtWidgets.QComboBox()
     tmode.addItems(["Auto, local OCR (rec.)", "Manual entry each lap"])
@@ -102,7 +106,7 @@ def show_setup_dialog(detected_summary: str = "",
 
     # Let the combos shrink instead of dictating the dialog width by their longest
     # item: size to a modest content length (the popup still shows full text).
-    for c in (target, disc, cpt, lpt, agg, tmode):
+    for c in (target, disc, cpt, lpt, agg, aggro, tmode):
         c.setSizeAdjustPolicy(
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         c.setMinimumContentsLength(22)
@@ -176,4 +180,5 @@ def show_setup_dialog(detected_summary: str = "",
             "front_weight": float(fw.value()), "changes_per_test": cpt.currentIndex() + 1,
             "laps_per_test": laps, "lap_agg": "median" if agg.currentIndex() == 1 else "best",
             "temp_mode": "manual" if tmode.currentIndex() == 1 else "auto",
+            "aggressiveness": ("fine", "normal", "coarse")[aggro.currentIndex()],
             "use_vision_api": bool(vapi.isChecked())}
