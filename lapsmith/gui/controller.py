@@ -69,6 +69,7 @@ class Controller:
     phase: str = WAIT_TELEMETRY
     identity: Optional[CarIdentity] = None
     discipline: str = "road"
+    target_class: Optional[str] = None    # user-chosen build target ("B 700" etc.)
     limits: CarLimits = field(default_factory=CarLimits)
 
     baseline: Optional[Tune] = None
@@ -257,7 +258,8 @@ class Controller:
                     changes_per_test: Optional[int] = None,
                     laps_per_test: object = None, lap_agg: Optional[str] = None,
                     temp_mode: Optional[str] = None,
-                    use_vision_api: Optional[bool] = None):
+                    use_vision_api: Optional[bool] = None,
+                    target_class: Optional[str] = None):
         self.discipline = discipline
         self.limits = limits or CarLimits()
         if temp_mode in ("auto", "manual"):
@@ -275,7 +277,10 @@ class Controller:
             self.laps_per_test = laps_per_test
         if lap_agg in ("best", "median"):
             self.lap_agg = lap_agg
-        target = self.identity.target_class if self.identity else "S1 800"
+        # the user's chosen target class wins; fall back to the auto-detected one.
+        self.target_class = (target_class
+                             or (self.identity.target_class if self.identity else "S1 800"))
+        target = self.target_class
         drivetrain = self.identity.drivetrain if self.identity else "AWD"
         car = self.identity.name if self.identity else "Car"
         self.baseline = build_baseline(car, target, discipline,
@@ -289,8 +294,9 @@ class Controller:
         if not self.baseline:
             return ""
         ident = self.identity
+        target = self.target_class or (ident.target_class if ident else "S1 800")
         return format_checklist(self.baseline, ident.name if ident else "Car",
-                                ident.target_class if ident else "S1 800",
+                                target,
                                 self.discipline, self.front_weight_pct,
                                 ident.drivetrain if ident else "AWD")
 
@@ -698,7 +704,8 @@ class Controller:
     def _meta(self) -> dict:
         ident = self.identity
         return {"car": ident.name if ident else "Car",
-                "car_class": ident.target_class if ident else "S1 800",
+                "car_class": (self.target_class
+                              or (ident.target_class if ident else "S1 800")),
                 "drivetrain": ident.drivetrain if ident else "AWD"}
 
     def finish(self):

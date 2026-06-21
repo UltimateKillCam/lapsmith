@@ -194,6 +194,23 @@ def main(argv=None) -> int:
             print(f"OCR_SELFCHECK_FAIL: {e}")
             return 1
 
+    # Diagnostic: LAPSMITH_IMPORT_SELFCHECK=<file> parses a car-name file (the same
+    # utf-8-sig path the Import dialog uses) and prints the counts, then exits. Lets
+    # a packaged build confirm the Nexus JSON / semicolon-CSV import path works.
+    chk = os.environ.get("LAPSMITH_IMPORT_SELFCHECK")
+    if chk:
+        from .. import car_import
+        try:
+            with open(chk, "r", encoding="utf-8-sig") as f:
+                text = f.read()
+            mapping, malformed = car_import.parse_text(text, chk)
+            print(f"IMPORT_SELFCHECK_OK parsed={len(mapping)} malformed={malformed}")
+            return 0
+        except Exception as e:
+            log.exception("import self-check FAILED")
+            print(f"IMPORT_SELFCHECK_FAIL: {e}")
+            return 1
+
     # Persist user-assigned car names + saved tunes under the app data dir.
     from .. import ordinals
     from ..state import store
@@ -384,7 +401,8 @@ def main(argv=None) -> int:
                 return
             ctrl.reset_session()                       # clean slate for a new car/run
             ctrl.confirm_car()                         # prompts for a name if unknown
-            res = setup_form.show_setup_dialog(ctrl.identity.summary())
+            res = setup_form.show_setup_dialog(ctrl.identity.summary(),
+                                               ctrl.identity.class_letter)
             if not res:
                 ctrl.log("Setup cancelled.")
                 ctrl.phase = C.WAIT_TELEMETRY
@@ -393,7 +411,8 @@ def main(argv=None) -> int:
                              changes_per_test=res["changes_per_test"],
                              laps_per_test=res["laps_per_test"], lap_agg=res["lap_agg"],
                              temp_mode=res.get("temp_mode"),
-                             use_vision_api=res.get("use_vision_api"))
+                             use_vision_api=res.get("use_vision_api"),
+                             target_class=res.get("target_class"))
             done_box["bundled"] = False
             log.info("setup applied: %s -> phase=%s",
                      {k: v for k, v in res.items() if k != "limits"}, ctrl.phase)

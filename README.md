@@ -23,7 +23,7 @@ Two options, no Python or command line required:
 
 The build is unsigned (signing certificates cost money I'm not spending on a free tool yet), so the first time you run it Windows SmartScreen will say "Windows protected your PC." Click **More info → Run anyway**. If you grabbed the zip, you might need to right-click it → Properties → **Unblock** before extracting.
 
-It comes back clean on VirusTotal — 0 of 68 engines flag it: [scan result](https://www.virustotal.com/gui/file/d20f7935b72274e67a17c78e981c4cf2d657c24d6dfe2ba8cc45d2e24f04afd7/detection). PyInstaller apps occasionally trip an antivirus heuristic anyway; if yours grumbles, it's a false positive and you can allow it.
+It comes back clean on VirusTotal — 0 of 68 engines flag it: [scan result](https://www.virustotal.com/gui/file/10b811875070296cf1f5c7f4666cc2e20818fe55b85857acbfa67511436753e8/detection). PyInstaller apps occasionally trip an antivirus heuristic anyway; if yours grumbles, it's a false positive and you can allow it.
 
 ## Quick start
 

@@ -64,10 +64,19 @@ def set_store_path(path: str) -> int:
     return load_user_map(path)
 
 
+def _looks_like_record(name: str) -> bool:
+    """True if a stored 'name' is actually a serialized record blob from the old
+    import bug (e.g. "{'display_name': '...', 'year': 1989, ...}") rather than a
+    real display name. Such junk is safe to OVERWRITE on import."""
+    s = (name or "").strip()
+    return s.startswith("{") or "display_name" in s
+
+
 def bulk_fill(mapping: Dict[int, str], path: Optional[str] = None) -> Dict[str, int]:
     """MERGE an imported {ordinal: name} map, filling GAPS only - any name the user
-    already set or edited (anything in the user map) is kept untouched. Writes the
-    store once. Returns {'imported': added, 'already': skipped}."""
+    already set or edited is kept untouched. EXCEPTION: a previously stored value
+    that looks like a serialized record (old-bug junk) is overwritten with the real
+    name. Writes the store once. Returns {'imported': added, 'already': skipped}."""
     path = path or NAMES_PATH
     added = skipped = 0
     for ordinal, name in mapping.items():
@@ -78,10 +87,11 @@ def bulk_fill(mapping: Dict[int, str], path: Optional[str] = None) -> Dict[str, 
         nm = str(name or "").strip()
         if o <= 0 or not nm:
             continue
-        if o in _USER_MAP:                # user-set/edited (or already imported) wins
-            skipped += 1
+        existing = _USER_MAP.get(o)
+        if existing is not None and not _looks_like_record(existing):
+            skipped += 1                  # genuine user/imported name wins
             continue
-        _USER_MAP[o] = nm
+        _USER_MAP[o] = nm                 # new gap, or repairing a record blob
         added += 1
     if added:
         _flush(path)

@@ -55,16 +55,16 @@ def class_letter(car_class_enum: int) -> str:
 
 
 def suggest_target_class(pi: int) -> str:
-    """Build-to-ceiling class our tuner targets, from the car's PI."""
+    """The car's OWN class (letter + PI ceiling) from its PI - the default build
+    target. No longer bumps the car up a class; the user can override it in setup.
+    Uses the shared class table so classes/ceilings stay consistent everywhere."""
+    from .knowledge.baseline import PI_CEILING, TARGET_CLASS_ORDER
     if pi <= 0:
-        return "S1 800"
-    if pi <= 700:
-        return "A 700"
-    if pi <= 800:
-        return "S1 800"
-    if pi <= 900:
-        return "S2 900"
-    return "R 998"
+        return f"A {PI_CEILING['A']}"
+    for c in TARGET_CLASS_ORDER:
+        if pi <= PI_CEILING[c]:
+            return f"{c} {PI_CEILING[c]}"
+    return f"X {PI_CEILING['X']}"
 
 
 def is_live(packet: Optional[Packet]) -> bool:

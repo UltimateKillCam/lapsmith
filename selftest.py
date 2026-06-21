@@ -418,10 +418,11 @@ def test_identity_autodetect():
     ident = identity.identify(pkt)
     check(f"car name from ordinal ({ident.name})", "CLK GTR" in ident.name)
     check("drivetrain AWD from DrivetrainType", ident.drivetrain == "AWD")
-    check(f"target class from PI 800 -> S1 800 (got {ident.target_class})",
-          ident.target_class == "S1 800")
-    check("PI 950 -> R 998", identity.suggest_target_class(950) == "R 998")
-    check("PI 650 -> A 700", identity.suggest_target_class(650) == "A 700")
+    check(f"target class from PI 800 -> A 800 (own class, no bump) (got {ident.target_class})",
+          ident.target_class == "A 800")
+    check("PI 950 -> S2 998 (own class)", identity.suggest_target_class(950) == "S2 998")
+    check("PI 650 -> B 700 (own class, not bumped to A)",
+          identity.suggest_target_class(650) == "B 700")
     # unknown ordinal (a later-update car) still works, shows Car #<n>
     check("unknown ordinal -> 'Car #<n>'", ordinals.name_for(987654) == "Car #987654")
     check("unknown ordinal not 'known'", not ordinals.is_known(987654))
@@ -441,6 +442,19 @@ def test_gui_controller():
     ctrl.apply_setup("road", lim, front_weight_pct=48.0)
     check("setup builds baseline + state", ctrl.baseline is not None and ctrl.state is not None)
     check("phase -> APPLY_BASELINE", ctrl.phase == C.APPLY_BASELINE)
+    # target class: defaults to the car's own detected class, user can override and
+    # the choice flows through to the baseline + the saved car_class metadata.
+    check("target class defaults to detected (no override)",
+          ctrl.target_class == ctrl.identity.target_class)
+    ctrl.apply_setup("road", lim, front_weight_pct=48.0, target_class="S2 998")
+    check("user-selected target class wins + flows to car_class metadata",
+          ctrl.target_class == "S2 998" and ctrl._meta()["car_class"] == "S2 998")
+    # the dropdown options + default label come from the shared class table
+    from lapsmith.knowledge import baseline as _bl
+    opts = _bl.target_class_options()
+    check("target dropdown options reuse the class table (D..X with ceilings)",
+          opts == ["D 500", "C 600", "B 700", "A 800", "S1 900", "S2 998", "X 999"]
+          and _bl.class_target_label("B") == "B 700")
     check("AWD detected -> baseline keeps centre diff", ctrl.baseline.diff_center > 0)
 
     # drive a bottoming test -> controller computes a clamped change
@@ -1285,6 +1299,39 @@ def test_car_import():
     s = car_import.import_text("200,Different Name\n", "h.csv")
     check("re-import never overwrites an existing name",
           s["imported"] == 0 and s["already"] == 1 and ordinals.name_for(200) == "Toyota Supra")
+
+    # the REAL Nexus "Forza Horizon 6 Car ID List" export: UTF-8 BOM, semicolon-
+    # delimited, CRLF, an 11-column header mapped BY NAME (display_name beats model).
+    hdr = ("car_id;display_name;year;make;model;asset;manufacturer_code;"
+           "raw_model;confidence;zip_file;internal_path")
+    body = [f"{900000 + i};Make {i} Display {i};2020;Make{i};Model{i};asset_{i};"
+            f"MC{i};raw{i};0.99;cars_{i}.zip;/data/cars/{i}" for i in range(638)]
+    body.append("not_an_id;Bad Ordinal;2020;X;Y;a;b;c;d;e;f")   # non-int ordinal
+    body.append(";Missing Ordinal;2020;X;Y;a;b;c;d;e;f")         # empty ordinal
+    nexus = "﻿" + "\r\n".join([hdr] + body) + "\r\n"
+    mp, malformed = car_import.parse_text(nexus, "car_names.csv")
+    check("Nexus CSV (BOM, semicolon, CRLF, 11-col header) -> ~638 by-name",
+          len(mp) == 638 and malformed == 2
+          and mp[900000] == "Make 0 Display 0")     # display_name, not model
+
+    # Nexus JSON: {ordinal: {record}} - store the INNER display_name, NOT the object.
+    recs = {str(910000 + i): {"display_name": f"Rec {i} Car {i}", "year": 1989,
+                              "make": f"Make{i}", "model": f"Model{i}"}
+            for i in range(638)}
+    mp2, mal2 = car_import.parse_text(json.dumps(recs), "cars.json")
+    check("Nexus JSON dict-of-records -> ~638 names (inner display_name, not the object)",
+          len(mp2) == 638 and mal2 == 0 and mp2[910000] == "Rec 0 Car 0"
+          and "{" not in mp2[910000] and "display_name" not in mp2[910000])
+
+    # REPAIR: a previously stored serialized-record blob is overwritten on import,
+    # but a genuine user-typed name is still preserved.
+    ordinals.save_name(920001, "{'display_name': '1989 Volkswagen Golf Rallye', 'year': 1989}")
+    ordinals.save_name(920002, "My Hand-Typed Name")
+    s = car_import.import_text("920001,Volkswagen Golf Rallye\n920002,Should Not Win\n", "r.csv")
+    check("import overwrites serialized-record junk but keeps genuine user names",
+          ordinals.name_for(920001) == "Volkswagen Golf Rallye"
+          and ordinals.name_for(920002) == "My Hand-Typed Name"
+          and s["imported"] == 1 and s["already"] == 1)
     # the credited Nexus link the dialog/CLI point at (no bundled data)
     check("import points users at the Nexus FH6 Car ID List page",
           car_import.NEXUS_CAR_LIST_URL == "https://www.nexusmods.com/forzahorizon6/mods/309"

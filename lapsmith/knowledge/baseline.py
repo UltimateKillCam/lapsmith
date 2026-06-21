@@ -12,7 +12,16 @@ from typing import Optional
 
 from ..state.tune_state import Tune, CarLimits, STOCK
 
-PI_CEILING = {"A": 700, "S1": 800, "S2": 900, "R": 998}
+# Class letter -> PI ceiling (Forza's class bands). SINGLE source of truth for the
+# Target-class dropdown, the auto-suggested target, the build target, and the
+# checklist display, so the classes and ceilings stay consistent everywhere.
+# ("R" is a legacy alias kept so any old "R 998" string still resolves.)
+PI_CEILING = {
+    "D": 500, "C": 600, "B": 700, "A": 800, "S1": 900, "S2": 998, "X": 999,
+    "R": 998,
+}
+# Low -> high, for the user-facing Target-class dropdown.
+TARGET_CLASS_ORDER = ("D", "C", "B", "A", "S1", "S2", "X")
 
 # Range-relative baselines (fraction of the car's slider range, 0=min .. 1=max).
 # (front, rear); rear slightly higher than front for rake on tarmac.
@@ -56,10 +65,23 @@ def canon_discipline(d: str) -> str:
 
 def canon_class(c: str) -> str:
     c = c.strip().upper().replace(" ", "")
-    for k in PI_CEILING:
+    # longest keys first so "S1"/"S2" win over any single-letter prefix
+    for k in sorted(PI_CEILING, key=len, reverse=True):
         if c.startswith(k):
             return k
     return "S1"
+
+
+def target_class_options() -> list:
+    """Ordered '<letter> <PI ceiling>' labels for the Target-class dropdown,
+    built from PI_CEILING so the dropdown stays consistent with everything else."""
+    return [f"{c} {PI_CEILING[c]}" for c in TARGET_CLASS_ORDER]
+
+
+def class_target_label(letter_or_class: str) -> str:
+    """'<letter> <ceiling>' for a class letter or class string ('B' -> 'B 700')."""
+    c = canon_class(letter_or_class)
+    return f"{c} {PI_CEILING[c]}"
 
 
 def _compound(discipline: str) -> str:
