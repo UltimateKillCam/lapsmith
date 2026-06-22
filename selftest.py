@@ -648,8 +648,8 @@ def test_auto_lap():
     cda.listener.push(_lap_packets(1, 0.0, 0.0)); cda.tick()       # at line, stationary
     check("stationary at line stays detecting (not wrongly manual)", cda.mode is None)
     cda.listener.push(_lap_packets(1, 0.6, 0.0)); cda.tick()       # CurrentLap rises (same lap)
-    check("AUTO-LAP engages once the lap timer advances; out-lap armed",
-          cda.mode == C.MODE_AUTO and cda._skip_laps == 1)
+    check("AUTO-LAP engages once the lap timer advances; warm-up laps armed",
+          cda.mode == C.MODE_AUTO and cda._skip_laps == rules.WARMUP_LAPS)
 
     # entering Rivals LATER (after a spell of dead fields) still engages auto
     clate = C.Controller(); clate.identity = ident
@@ -675,9 +675,11 @@ def test_auto_lap():
     cend.listener.push(_lap_packets(1, 1.0, 0.0)); cend.tick()
     cend.listener.push(_lap_packets(1, 3.0, 0.0)); cend.tick()      # CurrentLap rose -> engage
     check("tick path: AUTO engaged from detecting", cend.mode == C.MODE_AUTO)
-    cend.listener.push(_lap_packets(2, 1.0, 53.0)); cend.tick()     # lap 1 completes -> out-lap skipped
-    check("tick path: out-lap skipped, no reference yet", cend.best_segment is None)
-    cend.listener.push(_lap_packets(3, 1.0, 52.0)); cend.tick()     # lap 2 completes -> baseline + change
+    cend.listener.push(_lap_packets(2, 1.0, 53.0)); cend.tick()     # warm-up lap 1 -> skipped
+    check("tick path: warm-up lap 1 skipped, no reference yet", cend.best_segment is None)
+    cend.listener.push(_lap_packets(3, 1.0, 54.0)); cend.tick()     # warm-up lap 2 -> skipped (WARMUP_LAPS=2)
+    check("tick path: warm-up lap 2 skipped, no reference yet", cend.best_segment is None)
+    cend.listener.push(_lap_packets(4, 1.0, 52.0)); cend.tick()     # full lap -> baseline + change
     check("tick path: baseline reference from a full lap (52.0)",
           cend.best_segment is not None and abs(cend.best_segment - 52.0) < 1e-6)
     check("tick path: FIRST CHANGE emitted (overlay would show NEXT)",
@@ -856,6 +858,374 @@ def test_reload_and_fixation():
           rules.step_mult_for("coarse") > rules.step_mult_for("normal") > rules.step_mult_for("fine"))
 
 
+def _slip_window(rear_slip, n=240):
+    out = []
+    for i in range(n):
+        v = simulator.frame(i * 0.05, "oversteer")
+        v["tire_slip_ratio_rl"] = v["tire_slip_ratio_rr"] = rear_slip
+        out.append(parse(simulator._build_packet(v)))
+    return aggregate(out)
+
+
+def test_dirt_diff_and_lever_cap():
+    print("\n== regression: dirt slip thresholds + general per-lever no-improve cap ==")
+    from lapsmith.knowledge import rules
+    from lapsmith.knowledge.rules import Recommendation
+    from lapsmith.gui import controller as C
+    from lapsmith.state.tune_state import Tune, CarLimits
+    from lapsmith import identity
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+
+    # --- C: discipline-aware on-power slip threshold (the Audi mismatch) ---------
+    s = _slip_window(0.45)           # ~0.45 on-power rear slip (normal dirt wheelspin)
+    t = Tune(); t.diff_rear_accel = 80.0
+    rec_road = rules._rule_diff(s, t, "road", None, True, CarLimits())
+    rec_dirt = rules._rule_diff(s, t, "dirt", None, False, CarLimits())
+    check("road: 0.45 on-power rear slip -> diff rule FIRES (tarmac fault)",
+          rec_road is not None and "diff_rear_accel" in rec_road.fields)
+    check("dirt: 0.45 wheelspin is WANTED -> diff rule does NOT fire",
+          rec_dirt is None)
+    check("dirt on-power threshold (0.60) > road (0.30)",
+          rules.ON_POWER_OS_SLIP_DIRT > rules.ON_POWER_OS_SLIP)
+
+    # --- D: dirt accel-diff driveability floor -----------------------------------
+    s_hi = _slip_window(0.75)        # severe slip: even dirt would flag it
+    t2 = Tune(); t2.diff_rear_accel = 53.0
+    rec_floor = rules._rule_diff(s_hi, t2, "dirt", None, False, CarLimits())
+    check("dirt: a firing accel-diff change is FLOORED at >= 50% (keeps drive)",
+          rec_floor is not None
+          and rec_floor.fields.get("diff_rear_accel") >= rules.DIRT_ACCEL_DIFF_FLOOR)
+    t3 = Tune(); t3.diff_rear_accel = rules.DIRT_ACCEL_DIFF_FLOOR
+    check("dirt: at the floor the accel diff can't be cut further",
+          rules._rule_diff(s_hi, t3, "dirt", None, False, CarLimits()) is None)
+
+    # --- A+B: general per-lever cap -> lock + roll back to last-improving ---------
+    cc = C.Controller(); cc.identity = ident
+    cc.apply_setup("dirt", CarLimits()); cc.mode = C.MODE_AUTO
+    cc.best_segment = 52.0
+    cc.state.current.set("diff_rear_accel", 35.0)
+    cc._last_improving = {"diff_rear_accel": 35.0}     # 35 was the last improving value
+    for attempt in (1, 2):
+        rec = cc.state.apply_change("diff", {"diff_rear_accel": 30.0}, "neutral test", "")
+        cc._applied_records = [rec]
+        cc._apply_fitness_multi(52.0, 0.0)             # neutral (no gain): revert + count
+        check(f"neutral attempt {attempt}: NOT banked - rolled back to 35.0",
+              abs(cc.state.current.get("diff_rear_accel") - 35.0) < 1e-6
+              and rec.verdict == "reverted" and rec.seg_after_s == 52.0)
+    check("diff_rear_accel:down LOCKED after the cap",
+          "diff_rear_accel:down" in cc._lever_locked
+          and cc._noimprove.get("diff_rear_accel:down") == rules.LEVER_NOIMPROVE_CAP)
+    filt = rules._filter_locked_levers(
+        Recommendation("diff", {"diff_rear_accel": 30.0}, "x", ""), cc.state.current,
+        cc._lever_locked)
+    check("locked diff:down move is filtered out (no longer 'a rule fired')", filt is None)
+
+    # --- B: a genuine improvement KEEPS (Veneno path unaffected, not capped) ------
+    cv = C.Controller(); cv.identity = ident
+    cv.apply_setup("road", CarLimits()); cv.mode = C.MODE_AUTO
+    cv.best_segment = 60.0
+    rkeep = cv.state.apply_change("arb", {"arb_r": 55.0}, "improve test", "")
+    cv._applied_records = [rkeep]
+    cv._apply_fitness_multi(59.0, 0.0)                 # -1.0s > LAP_IMPROVE_EPS -> KEEP
+    check("genuine improvement kept (best 59.0), lever not locked, counter reset",
+          abs(cv.best_segment - 59.0) < 1e-6 and rkeep.verdict == "kept"
+          and "arb_r:up" not in cv._lever_locked and cv._noimprove.get("arb_r:up", 0) == 0)
+    check("seg_after_s populated for the keep/revert audit trail",
+          rkeep.seg_after_s == 59.0 and rkeep.seg_before_s == 60.0)
+
+    # --- E: a locked lever drops out of analyze_batch so the loop can converge ----
+    s_os = _slip_window(0.45)
+    to = Tune(); to.diff_rear_accel = 80.0
+    open_b = rules.analyze_batch(s_os, to, "road", max_search=0)
+    lock_b = rules.analyze_batch(s_os, to, "road", max_search=0,
+                                 lever_locked={"diff_rear_accel:down"})
+    check("locked lever removed from analyze_batch (enables convergence)",
+          any("diff_rear_accel" in r.fields for r in open_b)
+          and not any("diff_rear_accel" in r.fields for r in lock_b))
+
+
+def _telem_lap(lap_time, exit_g=1.0, grip=1.2, slip=0.30, n=150):
+    """One lap of synthetic telemetry binnable by track position: corner bins (lateral
+    g), corner-exit bins (throttle-on forward g + rear slip), and straights.
+    `exit_g` is the corner-exit forward g (the 'how quickly it accelerates' channel);
+    `grip` is cornering lateral g. distance_traveled advances so binning works."""
+    out = []
+    for i in range(n):
+        ph = i % 30
+        v = {"is_race_on": 1, "speed": 50.0, "distance_traveled": i / n * 1200.0,
+             "current_lap": i / n * lap_time, "last_lap": 0.0, "lap_number": 0,
+             "engine_max_rpm": 7000.0, "current_engine_rpm": 5200.0,
+             "drivetrain_type": 2, "accel": 255, "brake": 0}
+        if ph < 12:                       # corner: high lateral g, partial throttle
+            v["accel_x"] = grip * 9.80665
+            v["accel_z"] = 0.0
+            v["accel"] = 90
+            v["speed"] = 26.0
+            v["steer"] = 70
+        elif ph < 22:                     # corner exit: on throttle, forward g + slip
+            v["accel_x"] = 0.5 * 9.80665
+            v["accel_z"] = exit_g * 9.80665
+            v["tire_slip_ratio_rl"] = slip
+            v["tire_slip_ratio_rr"] = slip
+            v["speed"] = 34.0
+        else:                             # straight
+            v["accel_z"] = 0.3 * 9.80665
+            v["speed"] = 60.0
+        out.append(parse(simulator._build_packet(v)))
+    return out
+
+
+def test_telemetry_primary_fitness():
+    print("\n== drift-robust: telemetry-primary fitness, A/B/A, budget, honest final check ==")
+    from lapsmith.gui import controller as C
+    from lapsmith.knowledge import fitness
+    from lapsmith.knowledge.rules import Recommendation
+    from lapsmith.state.tune_state import CarLimits
+    from lapsmith.telemetry.laps import LapResult
+    from lapsmith import identity
+    import time as _t
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+
+    # --- H: the composite, binned by track position, sees an injected exit-g effect --
+    ref = fitness.bin_lap(_telem_lap(60.0, exit_g=1.0))
+    better = fitness.bin_lap(_telem_lap(60.0, exit_g=1.35))      # real tune effect
+    same = fitness.bin_lap(_telem_lap(60.0, exit_g=1.0))         # identical car behaviour
+    check("telemetry bins are live (grip + exit channels present)", ref.live and better.live)
+    comp_better = fitness.composite(better, ref, "road", group="diff")
+    comp_same = fitness.composite(same, ref, "road", group="diff")
+    check("composite identifies injected corner-exit forward-g gain (delta > eps)",
+          comp_better.delta > fitness.COMPOSITE_IMPROVE_EPS and comp_better.exit > 0)
+    check("composite ~0 for an identical car (no false positive from binning)",
+          abs(comp_same.delta) <= fitness.COMPOSITE_IMPROVE_EPS)
+
+    def new_ctrl(rigour="quick", budget=0.0):
+        c = C.Controller(); c.identity = ident
+        c.apply_setup("road", CarLimits(), rigour=rigour, time_budget_min=budget)
+        c.mode = C.MODE_AUTO
+        c.laps_per_test = 1
+        # preset a LIVE baseline anchor so telemetry-primary mode is engaged
+        c.best_segment = 60.0
+        c._baseline_lap_s = 60.0
+        c._ref_telem = fitness.bin_lap(_telem_lap(60.0, exit_g=1.0))
+        c._baseline_telem = c._ref_telem
+        return c
+
+    def measure(c, group, fields, lap_time, **telem):
+        """Drive ONE change through the REAL gate: apply, out-lap (skipped), measured lap."""
+        c._reanchor_pending = False           # isolate from periodic re-anchor
+        c._iters_since_reanchor = 0
+        c.batch = [Recommendation(group, fields, "test", "")]
+        c.change_applied()
+        c._on_lap(LapResult(c.lap_number + 1, 91.3, _telem_lap(91.3)))            # out-lap
+        c._on_lap(LapResult(c.lap_number + 1, lap_time, _telem_lap(lap_time, **telem)))
+
+    # --- (1) KEEP a real tune effect; DISCARD a neutral change that is only driver drift
+    c = new_ctrl()
+    measure(c, "diff", {"diff_rear_accel": 70.0}, 59.4, exit_g=1.35)   # real exit-g gain + faster
+    check("(1) real tune effect KEPT (telemetry composite, exit-g up)",
+          c.state.current.get("diff_rear_accel") == 70.0 and abs(c.best_segment - 59.4) < 1e-6)
+    c = new_ctrl()
+    measure(c, "arb", {"arb_r": 55.0}, 59.2, exit_g=1.0)              # FASTER lap, but SAME telemetry
+    check("(1) driver-drift-only change DISCARDED despite a faster lap (composite flat)",
+          c.state.current.get("arb_r") != 55.0 and c.best_segment == 60.0
+          and c._noimprove.get("arb_r:down", 0) >= 1)
+
+    # --- (2) anti-Goodhart guardrail: composite up but lap time clearly worse -> not kept
+    c = new_ctrl()
+    measure(c, "diff", {"diff_rear_accel": 70.0}, 60.6, exit_g=1.4)   # composite up, lap +0.6s worse
+    check("(2) guardrail blocks a composite 'win' when lap time is clearly worse",
+          c.state.current.get("diff_rear_accel") != 70.0 and c.best_segment == 60.0)
+
+    # --- (3) A/B/A operates on the composite ----------------------------------------
+    #   real gain: reverting to A drops exit-g back down -> B beats A' -> confirm & keep
+    c = new_ctrl(rigour="confirmed")
+    measure(c, "diff", {"diff_rear_accel": 70.0}, 59.5, exit_g=1.35)
+    check("(3) apparent win triggers A/B/A (revert-to-A confirmation shown)",
+          c._aba is not None and c.phase == C.SHOW_CHANGE and c.batch[0].group == "confirm_revert")
+    c.change_applied()                                               # user reverts to A, drives A'
+    c._on_lap(LapResult(c.lap_number + 1, 91.7, _telem_lap(91.7)))   # out-lap
+    c._on_lap(LapResult(c.lap_number + 1, 59.9, _telem_lap(59.9, exit_g=1.0)))   # A' = low exit-g
+    check("(3) A/B/A CONFIRMS a real gain (B beats re-measured A') -> re-apply shown",
+          c._aba is None and c.phase == C.SHOW_CHANGE and c.batch[0].group == "confirm_reapply")
+    c.change_applied()
+    check("(3) confirmed change re-applied and kept",
+          c.state.current.get("diff_rear_accel") == 70.0)
+    #   driver drift: reverting to A STILL shows high exit-g (the driver, not the tune)
+    c = new_ctrl(rigour="confirmed")
+    measure(c, "diff", {"diff_rear_accel": 70.0}, 59.5, exit_g=1.35)
+    c.change_applied()
+    c._on_lap(LapResult(c.lap_number + 1, 91.7, _telem_lap(91.7)))
+    c._on_lap(LapResult(c.lap_number + 1, 59.6, _telem_lap(59.6, exit_g=1.35)))  # A' just as quick (same car)
+    check("(3) A/B/A DISCARDS a driver-drift win (A' matches B) -> reverted, re-anchored",
+          c._aba is None and c.state.current.get("diff_rear_accel") != 70.0
+          and not (c.batch and c.batch[0].group == "confirm_reapply"))
+
+    # --- (4) honest final check: 'within driver variation' when only the driver improved
+    c = new_ctrl()
+    c._begin_final_check(reason="converged")
+    check("(4) final check asks to re-measure the ORIGINAL baseline",
+          c._final_check and c.batch[0].group == "final_baseline")
+    c.change_applied()
+    c._on_lap(LapResult(c.lap_number + 1, 91.1, _telem_lap(91.1)))
+    c._on_lap(LapResult(c.lap_number + 1, 58.0, _telem_lap(58.0, exit_g=1.0)))   # baseline now FASTER, same car
+    check("(4) reports 'within driver variation' (baseline as fast, same telemetry)",
+          c.phase == C.DONE and "within driver variation" in c.final_verdict
+          and c.stop_reason == "converged")
+    #   confirmed-gain final check: optimised car genuinely better than re-measured baseline
+    c = new_ctrl()
+    c._ref_telem = fitness.bin_lap(_telem_lap(58.0, exit_g=1.4))     # optimised tune really better
+    c.best_segment = 58.0
+    c._begin_final_check(reason="converged")
+    c.change_applied()
+    c._on_lap(LapResult(c.lap_number + 1, 91.1, _telem_lap(91.1)))
+    c._on_lap(LapResult(c.lap_number + 1, 60.0, _telem_lap(60.0, exit_g=1.0)))   # baseline slower + low exit-g
+    check("(4) reports a CONFIRMED tune improvement when the car is genuinely better",
+          c.phase == C.DONE and "Confirmed tune improvement" in c.final_verdict)
+
+    # --- (5) wall-clock budget: starts at first lap, stops AFTER the in-flight test ---
+    c = new_ctrl(budget=20.0)
+    check("(5) budget not started before the first lap", c.budget_remaining_s() is None)
+    c._budget_start = _t.perf_counter()         # simulate the first-lap clock start
+    check("(5) budget counts down once started", 0 < c.budget_remaining_s() <= 20 * 60)
+    c._budget_start = _t.perf_counter() - (20 * 60 + 30)   # simulate elapsed incl. loads/menus
+    # an in-flight measurement must finish cleanly, THEN the loop stops via the final check
+    # (the deadline passed mid-test; _check_budget latches it at the decision point)
+    measure(c, "diff", {"diff_rear_accel": 70.0}, 59.4, exit_g=1.35)
+    check("(5) in-flight test finished before stopping (change still gated, not cut)",
+          c.state.current.get("diff_rear_accel") == 70.0)
+    # the budget-expiry was latched during the measurement and routes to the final check
+    check("(5) budget expiry latched, honest final check queued",
+          c._budget_expired and c._final_check and c.batch[0].group == "final_baseline")
+    c.change_applied()
+    c._on_lap(LapResult(c.lap_number + 1, 91.0, _telem_lap(91.0)))
+    c._on_lap(LapResult(c.lap_number + 1, 60.0, _telem_lap(60.0, exit_g=1.0)))
+    check("(5) stop reason recorded as the time budget",
+          c.phase == C.DONE and c.stop_reason == "stopped: time budget (20 min)")
+
+    # --- regression: the Audi drift case (lap-time gain was the driver, not the tune) -
+    #   composite stays flat across a 'faster' driver-drift lap -> not banked.
+    c = new_ctrl()
+    base_best = c.best_segment
+    for lt in (59.5, 59.0, 58.5):       # driver keeps getting faster, telemetry unchanged
+        measure(c, "diff", {"diff_rear_accel": 70.0}, lt, exit_g=1.0)
+    check("(regression/Audi) pure driver drift never banks a tune change",
+          c.state.current.get("diff_rear_accel") != 70.0 and c.best_segment == base_best)
+
+
+def test_checklists_and_overlay_states():
+    print("\n== exact change/revert checklists + ACTION/DRIVE overlay + early-finish ==")
+    import os, tempfile, types
+    import time as _t
+    from lapsmith.gui import controller as C
+    from lapsmith.knowledge import fitness
+    from lapsmith.knowledge.rules import Recommendation
+    from lapsmith.state.tune_state import CarLimits
+    from lapsmith.telemetry.laps import LapResult
+    from lapsmith.state import prefs
+    from lapsmith import identity
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+
+    def ctrl(rig="quick", bud=0.0):
+        c = C.Controller(); c.identity = ident
+        c.apply_setup("road", CarLimits(), rigour=rig, time_budget_min=bud)
+        c.mode = C.MODE_AUTO; c.laps_per_test = 1
+        c.best_segment = 60.0; c._baseline_lap_s = 60.0
+        c._ref_telem = fitness.bin_lap(_telem_lap(60.0, exit_g=1.0))
+        c._baseline_telem = c._ref_telem
+        c._on_car = c.state.current.as_dict()      # car physically on the current tune
+        return c
+
+    def find(cl, fld):
+        return next((x for x in cl if x["field"] == fld), None)
+
+    # --- Item 1: APPLY shows exact field old->new -------------------------------
+    c = ctrl()
+    c.batch = [Recommendation("diff", {"diff_rear_accel": 70.0}, "t", "")]; c.phase = C.SHOW_CHANGE
+    it = find(c.menu_checklist(), "diff_rear_accel")
+    check("(1) applying a change lists the exact field old->new (80 -> 70)",
+          it and "80" in it["from"] and "70" in it["to"])
+    ui = c.ui_state()
+    check("(1) apply is ACTION REQUIRED with a checklist + F8",
+          ui["klass"] == "action" and ui["checklist"] and "CHANGE THESE NOW" in ui["header"])
+
+    # --- Item 1: REVERT states the exact set-BACK values ------------------------
+    c = ctrl()
+    c._on_car["diff_rear_decel"] = 10.0            # user physically set 10...
+    c.state.current.set("diff_rear_decel", 15.0)   # ...but the gate reverted to 15
+    c.batch = []
+    it = find(c.menu_checklist(), "diff_rear_decel")
+    check("(1) revert states the exact set-back (Rear Decel diff 10 -> 15)",
+          it and "10" in it["from"] and "15" in it["to"])
+
+    # --- Item 1: final check with NO diff -> 'already on baseline, just drive' ---
+    c = ctrl()
+    c._begin_final_check(reason="converged")
+    ui = c.ui_state()
+    check("(1) final check, car already on baseline -> JUST DRIVE, no checklist",
+          ui["klass"] == "drive" and "already on the baseline" in ui["header"].lower()
+          and not ui["checklist"])
+    # final check WITH a diff -> list the set-back to baseline
+    c = ctrl()
+    c._on_car["diff_rear_accel"] = 70.0
+    c._begin_final_check(reason="converged")
+    it = find(c.ui_state()["checklist"], "diff_rear_accel")
+    check("(1) final check with a diff lists the set-back to baseline (70 -> 80)",
+          c.ui_state()["klass"] == "action" and it and "70" in it["from"] and "80" in it["to"])
+
+    # --- Item 2: ACTION vs JUST-DRIVE are visually distinct classes -------------
+    c = ctrl()
+    c.batch = [Recommendation("diff", {"diff_rear_accel": 70.0}, "t", "")]; c.change_applied()
+    out = c.ui_state()
+    check("(2) out-lap is JUST DRIVE (no checklist), not an action prompt",
+          out["klass"] == "drive" and "OUT-LAP" in out["header"] and not out["checklist"])
+    c._on_lap(LapResult(c.lap_number + 1, 91.3, _telem_lap(91.3)))   # consume the out-lap
+    meas = c.ui_state()
+    check("(2) measuring lap is JUST DRIVE and labelled MEASURING lap x/y",
+          meas["klass"] == "drive" and "MEASURING" in meas["header"])
+    c2 = ctrl(); c2.batch = [Recommendation("arb", {"arb_r": 55.0}, "t", "")]; c2.phase = C.SHOW_CHANGE
+    check("(2) a shown change is a different class (action) from a measuring lap (drive)",
+          c2.ui_state()["klass"] == "action" and meas["klass"] == "drive")
+    # re-anchor stays 'no change to enter'
+    c3 = ctrl(); c3._begin_reanchor()
+    check("(2) re-anchor is JUST DRIVE, no change to enter",
+          c3.ui_state()["klass"] == "drive" and "RE-ANCHOR" in c3.ui_state()["header"]
+          and not c3.ui_state()["checklist"])
+
+    # --- Item 3: main-window Max-tuning-time control changes + persists ---------
+    prefs.set_store_path(os.path.join(tempfile.mkdtemp(), "prefs.json"))
+    c = ctrl()
+    c.set_time_budget(12.0); prefs.set("time_budget_min", 12.0)
+    check("(3) Max-tuning-time updates the live budget", c.time_budget_min == 12.0)
+    check("(3) budget persists via prefs (one source of truth)", prefs.time_budget_min() == 12.0)
+    c._budget_start = _t.perf_counter() - 13 * 60        # 13 min already elapsed
+    c.set_time_budget(12.0)                              # tighten mid-run
+    check("(3) tightening the budget mid-run applies to the running clock",
+          c._budget_expired)
+
+    # --- Item 4: convergence finishes EARLY (budget unspent), reason 'converged' -
+    c = ctrl(bud=20.0); c._budget_start = _t.perf_counter()
+    def _converge(self): self.phase = C.DONE; self.batch = []
+    c._compute_batch = types.MethodType(_converge, c)
+    c._next_step()
+    check("(4) convergence wins over re-anchor and stops early (budget unspent)",
+          c._final_check and not c._budget_expired and (c.budget_remaining_s() or 0) > 0)
+    c.change_applied()
+    c._on_lap(LapResult(c.lap_number + 1, 91.0, _telem_lap(91.0)))
+    c._on_lap(LapResult(c.lap_number + 1, 60.0, _telem_lap(60.0, exit_g=1.0)))
+    check("(4) a converged run saves stop_reason 'converged'",
+          c.phase == C.DONE and c.stop_reason == "converged")
+    # contrast: a run cut off by the clock saves 'stopped: time budget'
+    c = ctrl(bud=20.0); c._budget_start = _t.perf_counter() - (20 * 60 + 30)
+    c.batch = [Recommendation("diff", {"diff_rear_accel": 70.0}, "t", "")]; c.change_applied()
+    c._on_lap(LapResult(c.lap_number + 1, 91.0, _telem_lap(91.0)))
+    c._on_lap(LapResult(c.lap_number + 1, 59.4, _telem_lap(59.4, exit_g=1.35)))
+    c.change_applied()
+    c._on_lap(LapResult(c.lap_number + 1, 91.0, _telem_lap(91.0)))
+    c._on_lap(LapResult(c.lap_number + 1, 58.0, _telem_lap(58.0, exit_g=1.0)))
+    check("(4/minor) a clock cutoff saves stop_reason 'stopped: time budget' (not 'converged')",
+          c.phase == C.DONE and c.stop_reason == "stopped: time budget (20 min)")
+
+
 def test_batch_changes():
     print("\n== batch changes (evidence together, search rate-limited, batch revert) ==")
     from lapsmith.gui import controller as C
@@ -956,21 +1326,23 @@ def test_multi_lap_fitness():
     check("3 laps finalize; best-of-N improves (49.6 < 50.0)",
           abs(c.best_segment - 49.6) < 1e-6 and not c._awaiting_test)
 
-    # NOISE gate: a regression WITHIN lap spread is inconclusive -> held, not locked
+    # NEUTRAL gate (v0.1.7): a delta within lap spread no longer banks drift - it is
+    # REVERTED (best unchanged) and counted against the lever, but not yet locked.
     c = fresh(laps=3); c.best_segment = 50.0
     c.stats = aggregate(_window("understeer")); c._compute_batch()
-    apply_then(c, (50.4, 50.1, 50.6))           # best 50.1, spread 0.5s is the noise
-    check("within-noise regression NOT reverted (inconclusive hold)",
-          len(c.state.converged_levers) == 0)
+    apply_then(c, (50.4, 50.1, 50.6))           # best 50.1 vs 50.0 = +0.1 (neutral)
+    check("neutral lap NOT banked: best stays 50.0, lever counted not locked",
+          abs(c.best_segment - 50.0) < 1e-6 and len(c.state.converged_levers) == 0
+          and len(c._lever_locked) == 0 and any(v >= 1 for v in c._noimprove.values()))
 
-    # EVIDENCE protection: a small regression past the plain gate is NOT reverted
-    # unless it clears the extra evidence margin.
+    # EVIDENCE protection: a small regression past the plain gate is NEUTRAL (not a
+    # hard regress) so the lever is NOT LOCKED unless it clears the evidence margin.
     c = fresh(laps=2); c.best_segment = 50.0
     c.stats = aggregate(_window("understeer")); c._compute_batch()
     check("batch contains an evidence change (camber)",
           any(r.kind == "evidence" for r in c.batch))
     apply_then(c, (50.35, 50.35))               # +0.35: > 0.2 gate but < 0.2+0.3 evidence
-    check("evidence change survives a small regression (not reverted)",
+    check("evidence change not LOCKED on a small regression (within evidence margin)",
           len(c.state.converged_levers) == 0)
     c = fresh(laps=2); c.best_segment = 50.0
     c.stats = aggregate(_window("understeer")); c._compute_batch()
@@ -1740,6 +2112,9 @@ if __name__ == "__main__":
     test_auto_lap()
     test_f8_rivals_autolap()
     test_reload_and_fixation()
+    test_dirt_diff_and_lever_cap()
+    test_telemetry_primary_fitness()
+    test_checklists_and_overlay_states()
     test_batch_changes()
     test_multi_lap_fitness()
     test_lateral_capture_axis()

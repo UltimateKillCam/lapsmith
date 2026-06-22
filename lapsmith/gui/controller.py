@@ -25,8 +25,9 @@ from ..telemetry.session import aggregate, TestStats, HIGH_G_THRESHOLD
 from ..telemetry import segment
 from ..identity import identify, is_live, CarIdentity
 from .. import ordinals, PRODUCT_NAME
-from ..knowledge.baseline import build_baseline, format_checklist
+from ..knowledge.baseline import build_baseline, format_checklist, field_label, fmt_field
 from ..knowledge import rules
+from ..knowledge import fitness
 from ..state.tune_state import Tune, TuneState, CarLimits
 from ..state import store
 from ..telemetry.laps import LapWatcher, LapResult, LAP_TIME_FLOOR
@@ -132,6 +133,30 @@ class Controller:
     _cur_bottoming_axles: set = field(default_factory=set)   # this batch's bottoming axles
     _last_symptom: Optional[str] = None
     _symptom_streak: int = 0
+    # GENERAL anti-fixation: per-lever-key ("field:dir") consecutive non-improving
+    # count, the set of locked lever-keys, and each field's last value that actually
+    # improved the best lap (to roll back to on lock).
+    _noimprove: dict = field(default_factory=dict)
+    _lever_locked: set = field(default_factory=set)
+    _last_improving: dict = field(default_factory=dict)
+    # --- drift-robust methodology (telemetry-primary fitness) -------------------
+    rigour: str = "confirmed"          # "quick" (single pass) | "confirmed" (A/B/A)
+    time_budget_min: float = 0.0       # 0 = unlimited; wall-clock from first lap
+    _ref_telem: object = None          # accepted tune's binned telemetry (A)
+    _baseline_telem: object = None     # ORIGINAL session baseline telemetry (final check)
+    _test_packets: list = field(default_factory=list)   # packets across the measurement
+    _warmup_seen: int = 0              # warm-up laps before the first baseline
+    _iters_since_reanchor: int = 0
+    _aba: object = None                # in-flight A/B/A confirmation, or None
+    _aba_keep: object = None           # A/B/A-confirmed B, awaiting re-apply
+    _reanchor_pending: bool = False    # next measurement re-anchors the baseline
+    _final_check: bool = False         # in-flight honest final re-measure of the baseline
+    _final_check_done: bool = False
+    _budget_start: float = 0.0         # perf_counter at the first green lap (0=not started)
+    _budget_expired: bool = False
+    stop_reason: str = ""              # "converged" | "stopped: time budget (N min)"
+    final_verdict: str = ""            # honest result text after the final check
+    _on_car: dict = field(default_factory=dict)   # values PHYSICALLY entered in-game now
     # change aggressiveness -> step multiplier (fine 0.5 / normal 1.0 / coarse 2.0).
     aggressiveness: str = "normal"
     stale: int = 0
@@ -257,8 +282,27 @@ class Controller:
         self._last_ride_change = None
         self._bottoming_attempts = {}
         self._bottoming_locked = set()
+        self._cur_bottoming_axles = set()
         self._last_symptom = None
         self._symptom_streak = 0
+        self._noimprove = {}
+        self._lever_locked = set()
+        self._last_improving = {}
+        self._ref_telem = None
+        self._baseline_telem = None
+        self._test_packets = []
+        self._warmup_seen = 0
+        self._iters_since_reanchor = 0
+        self._aba = None
+        self._aba_keep = None
+        self._reanchor_pending = False
+        self._final_check = False
+        self._final_check_done = False
+        self._budget_start = 0.0
+        self._budget_expired = False
+        self.stop_reason = ""
+        self.final_verdict = ""
+        self._on_car = {}
         self.error = None
         self.started_iso = _dt.datetime.now().isoformat(timespec="seconds")
 
@@ -286,10 +330,16 @@ class Controller:
                     temp_mode: Optional[str] = None,
                     use_vision_api: Optional[bool] = None,
                     target_class: Optional[str] = None,
-                    aggressiveness: Optional[str] = None):
+                    aggressiveness: Optional[str] = None,
+                    rigour: Optional[str] = None,
+                    time_budget_min: Optional[float] = None):
         self.discipline = discipline
         if aggressiveness in ("fine", "normal", "coarse"):
             self.aggressiveness = aggressiveness
+        if rigour in ("quick", "confirmed"):
+            self.rigour = rigour
+        if time_budget_min is not None:
+            self.time_budget_min = max(0.0, float(time_budget_min))
         self.limits = limits or CarLimits()
         if temp_mode in ("auto", "manual"):
             self.temp_mode = temp_mode
@@ -338,6 +388,8 @@ class Controller:
         self._watcher.reset()
         self._tick_mark = self.listener.mark if self.listener else 0
         self.phase = DRIVE_AUTO
+        # the car is now PHYSICALLY on the baseline values the user just entered
+        self._on_car = self.state.current.as_dict() if self.state else {}
         self.log("Detecting lap timing... drive a lap (AUTO-LAP engages when the "
                  "timer advances), or press [F9] to mark a manual segment.")
 
@@ -388,10 +440,29 @@ class Controller:
             # engage AUTO-LAP the instant the lap timer is seen advancing
             if self.mode is None and adv:
                 self.mode = MODE_AUTO
-                self.arm_next_lap()       # ignore the partial lap already in progress
-                _laplog.info("MODE TRANSITION detecting -> AUTO (lap timer advancing)")
+                # WARM-UP GUARD (D): skip cold/learning laps before the first baseline
+                # so they don't set an artificially slow anchor.
+                self._skip_laps = max(1, rules.WARMUP_LAPS) if self.best_segment is None else 1
+                # TIME BUDGET (G): the clock starts at the FIRST Rivals lap and counts
+                # continuous real wall-clock (incl. loads/menus/applying changes); never paused.
+                if self.time_budget_min > 0 and self._budget_start == 0.0:
+                    self._budget_start = time.perf_counter()
+                    _laplog.info("TIME BUDGET: %.0f min clock STARTED at the first Rivals lap.",
+                                 self.time_budget_min)
+                    self.log(f"Tuning time budget: {int(self.time_budget_min)} min (real "
+                             "wall-clock from now, including loads/menus).")
+                _laplog.info("MODE TRANSITION detecting -> AUTO (lap timer advancing); "
+                             "skip_laps=%d (warm-up=%d)", self._skip_laps, rules.WARMUP_LAPS)
                 self.log("AUTO-LAP engaged - lap timer is live. Each completed lap is "
                          "captured automatically.")
+            # TIME BUDGET expiry: don't hard-cut; flag it so the in-flight test/A-B-A
+            # finishes cleanly, then the loop runs the honest final check and stops.
+            if (self._budget_start > 0.0 and not self._budget_expired
+                    and time.perf_counter() - self._budget_start >= self.time_budget_min * 60.0):
+                self._budget_expired = True
+                _laplog.info("TIME BUDGET reached (%.0f min) - finishing the in-flight test, "
+                             "then stopping.", self.time_budget_min)
+                self.log("Time budget reached - finishing current test.")
             # an event RESTART (race off->on, lap counter reset, or a reload's
             # CurrentLap-reset) re-arms the warm-up discard so lap 1 of the fresh
             # standing start is ignored - never mistaken for the measured lap.
@@ -483,6 +554,7 @@ class Controller:
         The BEST lap supplies the diagnostic telemetry + Heat reading."""
         t = lap.last_lap_s
         self._test_laps.append(t)
+        self._test_packets.extend(lap.packets)   # for track-position telemetry binning
         stats = aggregate(lap.packets)
         self._read_lap_heat()                  # per-lap Heat (resets the capture)
         if self._best_lap_time is None or t < self._best_lap_time:
@@ -496,41 +568,461 @@ class Controller:
             return
         self._finalize_test()
 
+    def budget_remaining_s(self) -> Optional[float]:
+        """Seconds left on the wall-clock budget (None if unlimited or not started)."""
+        if self.time_budget_min <= 0 or self._budget_start == 0.0:
+            return None
+        return max(0.0, self.time_budget_min * 60.0 - (time.perf_counter() - self._budget_start))
+
+    def set_time_budget(self, minutes: float):
+        """Change the wall-clock budget (main-window control). 0 = unlimited. If a run
+        is already on the clock, the new limit applies to the running budget."""
+        self.time_budget_min = max(0.0, float(minutes or 0.0))
+        if self.time_budget_min > 0 and self._budget_start > 0.0:
+            self._check_budget()        # a tighter limit may already be exceeded
+        elif self.time_budget_min == 0:
+            self._budget_expired = False
+        _laplog.info("TIME BUDGET set to %s.",
+                     "unlimited" if self.time_budget_min == 0 else f"{self.time_budget_min:.0f} min")
+
+    # ---- exact "change these" checklists + unmistakable overlay state ---------
+    def _target_tune_dict(self) -> dict:
+        """What the car SHOULD read after the user performs the currently shown action.
+        For the final check it is the ORIGINAL baseline; otherwise it is the current
+        accepted tune with the shown batch (not yet applied) overlaid."""
+        if not self.state:
+            return {}
+        if self.batch and self.batch[0].group == "final_baseline":
+            return self.baseline.as_dict() if self.baseline else {}
+        target = self.state.current.as_dict()
+        for rec in (self.batch or []):
+            target.update(rec.fields)
+        return target
+
+    def menu_checklist(self) -> list:
+        """The EXACT fields to change in the tune menu right now: only those that differ
+        between what's physically on the car (_on_car) and the target tune, each as a
+        from->to with its menu label. Covers both reverting the last change and the new
+        one in a single list, so the user never has to guess the old value."""
+        target = self._target_tune_dict()
+        out = []
+        for fld, to in target.items():
+            frm = self._on_car.get(fld, to)
+            try:
+                differs = abs(float(frm) - float(to)) > 1e-6
+            except (TypeError, ValueError):
+                differs = frm != to
+            if differs:
+                out.append({"field": fld, "label": field_label(fld),
+                            "from": fmt_field(fld, frm), "to": fmt_field(fld, to)})
+        return out
+
+    def ui_state(self) -> dict:
+        """Classify the overlay into ACTION (edit the menu now) vs DRIVE (touch nothing)
+        vs DONE, with an unambiguous header and - for ACTION - the exact checklist, so a
+        timed lap can never be confused with a go-to-the-menu prompt."""
+        ph = self.phase
+        if ph == DONE:
+            budget = self.stop_reason.startswith("stopped")
+            return {"klass": "done",
+                    "header": "TIME BUDGET REACHED" if budget else "DONE - converged",
+                    "sub": self.final_verdict or self.stop_reason or "converged",
+                    "checklist": []}
+        if ph == APPLY_BASELINE:
+            # the FULL baseline is rendered by the separate baseline-checklist block;
+            # no delta checklist here (the car isn't on a known tune yet).
+            return {"klass": "action", "action": "baseline",
+                    "header": "CHANGE THESE NOW - enter the baseline tune (full list below)",
+                    "sub": "Enter every value below, then press F8 when applied.",
+                    "checklist": []}
+        if ph == SHOW_CHANGE:
+            grp = self.batch[0].group if self.batch else ""
+            cl = self.menu_checklist()
+            if grp == "reanchor":
+                return {"klass": "drive", "header": "RE-ANCHOR - drive current tune, no changes",
+                        "sub": "No change to enter - drive a clean lap, press F8 when at the line.",
+                        "checklist": []}
+            if grp == "final_baseline" and not cl:
+                return {"klass": "drive", "header": "Car is already on the baseline - just drive",
+                        "sub": "Everything was reverted. Drive one clean lap for the honest "
+                               "final check, then press F8.", "checklist": []}
+            headers = {
+                "final_baseline": "CHANGE THESE NOW - set the car back to the baseline",
+                "confirm_revert": "CHANGE THESE NOW - revert to the previous tune",
+                "confirm_reapply": "CHANGE THESE NOW - re-apply the confirmed change",
+            }
+            return {"klass": "action", "action": grp or "change",
+                    "header": headers.get(grp, "CHANGE THESE NOW"),
+                    "sub": "Set each value below, then press F8 when applied.",
+                    "checklist": cl}
+        if ph == DRIVE_AUTO:
+            if self.mode is None:
+                return {"klass": "drive", "header": "DETECTING - drive a lap",
+                        "sub": "Auto-lap engages when the lap timer advances.", "checklist": []}
+            skip = self._skip_laps
+            if self._reanchor_pending:
+                hdr = ("RE-ANCHOR out-lap - get back to the line" if skip > 0
+                       else "RE-ANCHOR - drive the current tune (no changes)")
+            elif self._final_check:
+                hdr = ("FINAL CHECK out-lap - get back to the line" if skip > 0
+                       else "FINAL CHECK - drive the baseline clean")
+            elif self.best_segment is None and not self._awaiting_test:
+                hdr = ("WARM-UP - just drive (not counted)" if skip > 0
+                       else "BASELINE - drive a clean lap")
+            elif skip > 0:
+                hdr = "OUT-LAP - not counted, get back to the line"
+            else:
+                done = len(self._test_laps)
+                tgt = max(1, self._target_laps())
+                hdr = f"MEASURING - lap {min(done + 1, tgt)}/{tgt}, drive clean"
+            return {"klass": "drive", "header": hdr,
+                    "sub": "Do NOT touch the tune menu.", "checklist": []}
+        return {"klass": "info", "header": "", "sub": "", "checklist": []}
+
+    @property
+    def _telemetry_mode(self) -> bool:
+        """Telemetry-primary fitness is engaged only when the baseline anchor had
+        live channels. Otherwise we degrade to the lap-time gate everywhere (and
+        skip A/B/A, re-anchor and the final check)."""
+        return self._baseline_telem is not None and getattr(self._baseline_telem, "live", False)
+
     def _finalize_test(self):
         laps = self._test_laps
         test_time = min(laps) if self.lap_agg != "median" else _median(laps)
         noise = (max(laps) - min(laps)) if len(laps) >= 2 else 0.0
         self.stats = self._best_lap_stats if self._best_lap_stats is not None else self.stats
         self.tyre_reading = self._best_lap_reading
+        cand = fitness.bin_lap(self._test_packets)
         self._consume_ride_progress()
-        _laplog.info("test finalized: laps=%s -> %s %.2fs noise %.2fs",
-                     [round(x, 2) for x in laps], self.lap_agg, test_time, noise)
-        if self._awaiting_test:
-            _laplog.info("WAITING_FOR_MEASURED_LAP -> GATE: measured %.2fs vs best %s; "
-                         "running keep/revert fitness now.", test_time,
-                         f"{self.best_segment:.2f}" if self.best_segment else "n/a")
-            self._apply_fitness_multi(test_time, noise)
-            self._awaiting_test = False
-            self._await_state = None
-            self._pre_change_last_lap = None
-        elif self.best_segment is None:
+        _laplog.info("measurement: laps=%s -> %s %.2fs noise %.2fs telem(live=%s src=%s n=%d)",
+                     [round(x, 2) for x in laps], self.lap_agg, test_time, noise,
+                     cand.live, cand.pos_src, cand.n_frames)
+        self._reset_test()
+        was_awaiting = self._awaiting_test
+        self._awaiting_test = False
+        self._await_state = None
+        self._pre_change_last_lap = None
+
+        if self._aba is not None:                       # this measurement is A' (re-test of A)
+            self._resolve_aba(test_time, cand)
+            return
+        if self._final_check:                           # honest final re-measure of baseline (E)
+            self._resolve_final_check(test_time, cand)
+            return
+        if self._reanchor_pending:                      # re-measure of the accepted tune (C)
+            self._reanchor_pending = False
+            self._applied_records = []
+            if cand.live:
+                self._ref_telem = cand
+            if self.best_segment is None or test_time < self.best_segment:
+                self.best_segment = test_time
+            self._iters_since_reanchor = 0
+            _laplog.info("RE-ANCHOR: accepted tune re-measured at %.2fs (judging later "
+                         "changes against current driver pace).", test_time)
+            self.log(f"[re-anchor] baseline re-measured at {test_time:.2f}s "
+                     "(now comparing against your current pace).")
+            self._next_step()
+            return
+        if not was_awaiting and self.best_segment is None:    # the first baseline anchor (after warm-up)
             self.best_segment = test_time
             self._baseline_lap_s = test_time
-            self.log(f"[test] baseline reference {test_time:.2f}s "
-                     f"(best of {len(laps)}, noise {noise:.2f}s).")
-        self._reset_test()
-        self._compute_batch()
+            self._ref_telem = cand
+            self._baseline_telem = cand
+            self.log(f"[baseline] reference {test_time:.2f}s set "
+                     f"(telemetry-primary fitness {'ON' if cand.live else 'unavailable - lap-time only'}).")
+            self._next_step()
+            return
+        # a measured change B
+        if self._telemetry_mode and cand.live and self._ref_telem is not None \
+                and getattr(self._ref_telem, "live", False):
+            self._gate_change(test_time, noise, cand)
+        else:
+            _laplog.info("WAITING_FOR_MEASURED_LAP -> GATE: measured %.2fs vs best %s; "
+                         "lap-time fitness (telemetry not live).", test_time,
+                         f"{self.best_segment:.2f}" if self.best_segment else "n/a")
+            self._apply_fitness_multi(test_time, noise)
+            self._check_budget()
+            if self._budget_expired and not self._final_check_done:
+                self._begin_final_check(reason="budget")
+            else:
+                self._compute_batch()
 
-    def _reset_test(self):
-        self._test_laps = []
-        self._best_lap_time = None
-        self._best_lap_stats = None
-        self._best_lap_reading = None
+    def _check_budget(self):
+        """Latch budget expiry (belt-and-suspenders with tick: the deadline can pass
+        DURING a measurement, with no tick in between)."""
+        if (self._budget_start > 0.0 and not self._budget_expired and self.time_budget_min > 0
+                and time.perf_counter() - self._budget_start >= self.time_budget_min * 60.0):
+            self._budget_expired = True
+            _laplog.info("TIME BUDGET reached (%.0f min) at a decision point - stopping after "
+                         "the honest final check.", self.time_budget_min)
+
+    def _next_step(self):
+        """After a measurement decision: honour the time budget, schedule a periodic
+        re-anchor, otherwise compute the next change. On convergence, run the honest
+        final check before declaring a result."""
+        self._check_budget()
+        if self._budget_expired and not self._final_check_done:
+            self._begin_final_check(reason="budget")
+            return
+        # Compute the next change FIRST: genuine convergence must win over a pending
+        # re-anchor. The budget is a CEILING, not a target - if nothing is left to try
+        # we stop and save immediately, even with time on the clock.
+        self._compute_batch()
+        if self.phase == DONE:
+            if self._telemetry_mode and not self._final_check_done:
+                self._begin_final_check(reason="converged")
+            # else: already converged/degraded -> stop; the app saves on DONE.
+            return
+        # not converged: a periodic re-anchor may pre-empt the computed change (it is
+        # recomputed after the re-anchor measurement, so nothing is lost).
+        if self._telemetry_mode and self.best_segment is not None and not self._reanchor_pending:
+            self._iters_since_reanchor += 1
+            if self._iters_since_reanchor >= rules.BASELINE_REANCHOR_EVERY:
+                self._begin_reanchor()
+
+    # --- shared keep / revert mechanics (used by both gates) -------------------
+    def _count_and_lock(self, keys, delta):
+        """Per-lever no-improvement counting + cap-lock + roll-back to last improving."""
+        for key, fld, _prev in keys:
+            self._noimprove[key] = self._noimprove.get(key, 0) + 1
+            _laplog.info("ANTI-FIXATION: lever '%s' no-improvement %d/%d (delta %+.2fs).",
+                         key, self._noimprove[key], rules.LEVER_NOIMPROVE_CAP, delta)
+            if self._noimprove[key] >= rules.LEVER_NOIMPROVE_CAP \
+                    and key not in self._lever_locked:
+                self._lever_locked.add(key)
+                roll = self._last_improving.get(fld, self.state.current.get(fld))
+                self.state.current.set(fld, roll)
+                _laplog.info("ANTI-FIXATION: lever '%s' hit the no-improve cap (%d) - "
+                             "LOCKED and ROLLED BACK %s to its last improving value %.2f.",
+                             key, rules.LEVER_NOIMPROVE_CAP, fld, roll)
+                self.log(f"[anti-fixation] {fld} ({key.split(':')[1]}) made no gain in "
+                         f"{rules.LEVER_NOIMPROVE_CAP} tries - locked at {roll:.2f}; moving on.")
+
+    def _lock_bottoming_if_no_improve(self, improved, delta):
+        """A bottoming change that didn't clearly improve locks that axle's whole
+        remedy (ride->bump->spring escalation)."""
+        if not improved:
+            for axle in self._cur_bottoming_axles:
+                if axle not in self._bottoming_locked:
+                    self._bottoming_locked.add(axle)
+                    _laplog.info("ANTI-FIXATION: %s bottoming change did not improve "
+                                 "(%+.2fs) - GATE locking the axle's whole remedy.", axle, delta)
+                    self.log(f"[anti-fixation] {axle} bottoming change didn't help "
+                             f"({delta:+.2f}s) - locked; moving to other levers.")
+        self._cur_bottoming_axles = set()
+
+    def _keep_batch(self, test_time, cand=None):
+        """Bank the applied batch as a real gain."""
+        for r in self._applied_records:
+            r.verdict = "kept"
+        self.best_segment = test_time if self.best_segment is None else min(self.best_segment, test_time)
+        self.stale = 0
+        if cand is not None and getattr(cand, "live", False):
+            self._ref_telem = cand
+        for key, fld, _prev in self._batch_lever_keys():
+            self._noimprove[key] = 0
+            self._last_improving[fld] = self.state.current.get(fld)
+
+    def _revert_batch(self):
+        for r in reversed(self._applied_records):
+            for k, v in r.previous.items():
+                self.state.current.set(k, v)
+            r.verdict = "reverted"
+
+    # --- telemetry-primary gate (H) + A/B/A (B) --------------------------------
+    def _gate_change(self, test_time, noise, cand):
+        """Judge a measured change PRIMARILY on the binned-telemetry composite, with
+        lap time as a guardrail. Apparent wins go through A/B/A (confirmed rigour) to
+        separate a real tune gain from the driver simply improving over the session."""
+        ref = self._ref_telem
+        group = self._applied_records[0].lever_group if self._applied_records else ""
+        comp = fitness.composite(cand, ref, self.discipline, group=group)
+        lap_delta = test_time - self.best_segment if self.best_segment else 0.0
+        keys = self._batch_lever_keys()
+        for r in self._applied_records:
+            r.seg_before_s = self.best_segment
+            r.seg_after_s = test_time
+        _laplog.info("FITNESS(telemetry): composite %+.3f [grip %+.3f exit %+.3f trac %+.3f "
+                     "minspd %+.2f targeted(%s) %+.3f] | lap %+.2fs | rigour=%s",
+                     comp.delta, comp.grip, comp.exit, comp.traction, comp.minspeed,
+                     fitness.targeted_channel(group) or "-", comp.targeted, lap_delta, self.rigour)
+        apparent_win = comp.delta > fitness.COMPOSITE_IMPROVE_EPS
+
+        if apparent_win and lap_delta > fitness.LAPTIME_GUARDRAIL_S:
+            # anti-Goodhart: composite up but lap time clearly worse -> distrust it
+            _laplog.info("GUARDRAIL: composite improved but lap %+.2fs clearly worse "
+                         "(> %.2fs) - composite/lap-time DISAGREE; not keeping.",
+                         lap_delta, fitness.LAPTIME_GUARDRAIL_S)
+            self.log(f"[fitness] composite better but lap {lap_delta:+.2f}s worse - distrusted; reverted.")
+            self._revert_batch()
+            self.stale += 1
+            self._count_and_lock(keys, lap_delta)
+            self._lock_bottoming_if_no_improve(False, lap_delta)
+            self._applied_records = []
+            self.state.iteration += 1
+            self._next_step()
+            return
+
+        if apparent_win:
+            if self.rigour == "confirmed":
+                self._start_aba(test_time, cand, comp)   # drives its own A' measurement
+                return
+            # quick rigour: single-pass accept
+            self._keep_batch(test_time, cand)
+            self.log(f"[fitness] change KEPT - composite {comp.delta:+.3f} (telemetry-confirmed gain).")
+            self._lock_bottoming_if_no_improve(True, lap_delta)
+            self._applied_records = []
+            self.state.iteration += 1
+            self._next_step()
+            return
+
+        # not an apparent win -> don't bank driver drift; revert and count the lever(s)
+        self._revert_batch()
+        self.stale += 1
+        self.log(f"[fitness] change NOT banked - composite {comp.delta:+.3f} <= "
+                 f"{fitness.COMPOSITE_IMPROVE_EPS:.3f} (no telemetry gain); reverted.")
+        self._count_and_lock(keys, lap_delta)
+        self._lock_bottoming_if_no_improve(False, lap_delta)
+        self._applied_records = []
+        self.state.iteration += 1
+        self._next_step()
+
+    def _start_aba(self, b_time, b_telem, comp):
+        """Apparent win: revert to A and re-measure (A'), then compare B vs the NEWER
+        A'. The user re-enters the PREVIOUS values for the confirmation lap."""
+        a_records = list(self._applied_records)        # .previous = A values, .fields = B
+        self._aba = {"b_time": b_time, "b_telem": b_telem, "comp": comp.delta,
+                     "records": a_records}
+        prev = {}
+        for r in a_records:
+            prev.update(r.previous)
+        rec = rules.Recommendation(
+            "confirm_revert", dict(prev),
+            "That looked faster - but session-long driver improvement can fake a gain. "
+            "Revert to the PREVIOUS values and drive a confirmation measurement.",
+            "Confirming the gain is from the TUNE, not you driving better.")
+        rec.detail = "A/B/A confirmation: enter the previous values and drive a clean test."
+        self.batch = [rec]
+        self._applied_records = []
+        self.phase = SHOW_CHANGE
+        _laplog.info("A/B/A: apparent win (composite %+.3f) - reverting to A to re-measure (A').",
+                     comp.delta)
+        self.log("[A/B/A] Looked faster - revert to the previous tune and drive a confirmation "
+                 "test (separating a real tune gain from driver improvement).")
+
+    def _resolve_aba(self, aprime_time, aprime_telem):
+        aba, self._aba = self._aba, None
+        self._applied_records = []
+        comp = fitness.composite(aba["b_telem"], aprime_telem, self.discipline)
+        _laplog.info("A/B/A RESOLVE: B(time %.2f) vs A'(re-measured %.2f); composite(B vs A')=%+.3f.",
+                     aba["b_time"], aprime_time, comp.delta)
+        if comp.live and comp.delta > fitness.COMPOSITE_IMPROVE_EPS:
+            # B still beats the NEWER baseline -> real gain; re-apply B
+            b_fields = {}
+            for r in aba["records"]:
+                b_fields.update(r.fields)
+            self._aba_keep = {"b_telem": aba["b_telem"], "b_time": aba["b_time"]}
+            rec = rules.Recommendation(
+                "confirm_reapply", dict(b_fields),
+                "A/B/A CONFIRMED: the change still beats the re-measured baseline - a real "
+                "tune gain. Re-enter these values to keep it.", "Keeping the confirmed gain.")
+            rec.detail = "Re-enter the confirmed-faster values and continue."
+            self.batch = [rec]
+            self.phase = SHOW_CHANGE
+            _laplog.info("A/B/A: CONFIRMED real gain (composite %+.3f vs A') - re-applying B.", comp.delta)
+            self.log("[A/B/A] CONFIRMED a real tune gain - re-apply the change and continue.")
+        else:
+            # the apparent gain was driver drift -> keep A, re-anchor to the newer A'
+            if aprime_telem.live:
+                self._ref_telem = aprime_telem
+            if self.best_segment is None or aprime_time < self.best_segment:
+                self.best_segment = aprime_time
+            self._iters_since_reanchor = 0
+            _laplog.info("A/B/A: DISCARDED (composite %+.3f vs A' <= eps) - gain was DRIVER DRIFT; "
+                         "kept A and re-anchored to A' %.2f.", comp.delta, aprime_time)
+            self.log("[A/B/A] The gain was driver improvement, not the tune - DISCARDED; kept the "
+                     "previous tune and re-anchored to your current pace.")
+            self._next_step()
+
+    def _begin_reanchor(self):
+        """Re-drive the CURRENT accepted tune to re-baseline against current pace.
+        The user clicks Applied (no values change) -> change_applied arms the test."""
+        self._reanchor_pending = True
+        rec = rules.Recommendation(
+            "reanchor", {}, "Re-anchor: drive the CURRENT tune again so later changes are "
+            "judged against your current pace (no change to enter).", "")
+        rec.detail = "Just drive a clean measurement on the current tune."
+        self.batch = [rec]
+        self.phase = SHOW_CHANGE
+        _laplog.info("RE-ANCHOR: scheduling a re-measure of the accepted tune (every %d iters).",
+                     rules.BASELINE_REANCHOR_EVERY)
+        self.log("[re-anchor] drive the CURRENT tune again to re-baseline against your pace.")
+
+    def _begin_final_check(self, reason):
+        """Honest final check (E): re-measure the ORIGINAL baseline tune once more so
+        we can tell a real tune gain from the driver simply getting faster. The user
+        re-enters the baseline values, clicks Applied -> change_applied arms the test."""
+        self._final_check = True
+        self._final_check_done = True
+        self.stop_reason = (f"stopped: time budget ({int(self.time_budget_min)} min)"
+                            if reason == "budget" else "converged")
+        # Instruction-only (no fields): the user re-enters their ORIGINAL baseline by
+        # hand. We must NOT revert state.current here - it holds the optimised tune
+        # that finish() saves; the final check only compares the MEASURED telemetry.
+        rec = rules.Recommendation(
+            "final_baseline", {},
+            "Final honest check: re-enter your ORIGINAL baseline tune and drive one more "
+            "measurement. If the baseline is now as fast, the session gain was driver "
+            "improvement - we will say so rather than claim a tune win.", "")
+        rec.detail = "Re-enter the original baseline values and drive a clean measurement."
+        self.batch = [rec]
+        self.phase = SHOW_CHANGE
+        _laplog.info("FINAL CHECK (%s): re-measuring the ORIGINAL baseline tune for an honest verdict.",
+                     reason)
+        self.log("[final check] re-enter the ORIGINAL baseline tune and drive once more - "
+                 "separating real tune gains from driver improvement.")
+
+    def _resolve_final_check(self, base_time, base_telem):
+        self._final_check = False
+        self._applied_records = []
+        opt = self._ref_telem
+        comp = (fitness.composite(opt, base_telem, self.discipline)
+                if (opt is not None and getattr(opt, "live", False) and base_telem.live) else None)
+        best = self.best_segment if self.best_segment is not None else base_time
+        lap_gain = base_time - best                    # how much the optimised tune still wins on time
+        if comp is not None and comp.live:
+            confirmed = comp.delta > fitness.COMPOSITE_IMPROVE_EPS
+        else:
+            confirmed = lap_gain > rules.LAP_IMPROVE_EPS
+        if confirmed:
+            self.final_verdict = (
+                f"Confirmed tune improvement: composite "
+                f"{(comp.delta if comp else 0.0):+.3f}, lap {lap_gain:+.2f}s vs a re-measured "
+                f"baseline ({base_time:.2f}s).")
+            _laplog.info("FINAL CHECK: CONFIRMED tune gain - composite %+.3f, lap delta %+.2fs "
+                         "(baseline re-measured %.2fs).", (comp.delta if comp else 0.0), lap_gain, base_time)
+        else:
+            self.final_verdict = (
+                "Net improvement within driver variation - changes NOT confirmed. The "
+                f"re-measured baseline ({base_time:.2f}s) is as fast as the 'optimised' tune; "
+                "the session's lap-time gain was mostly you driving better, not the tune.")
+            _laplog.info("FINAL CHECK: NOT CONFIRMED - re-measured baseline %.2fs matches/beats the "
+                         "optimised tune (composite %+.3f); gain was driver improvement.",
+                         base_time, (comp.delta if comp else 0.0))
+        self.log(f"[final check] {self.final_verdict}")
+        self.phase = DONE
 
     def _apply_fitness_multi(self, test_time: float, noise: float):
-        """Keep/revert the batch from a MULTI-LAP test. Only act when the delta
-        clearly exceeds lap-to-lap noise; within noise = inconclusive (hold, don't
-        lock). Evidence-driven batches need an extra margin to be reverted."""
+        """Lap-time keep/revert gate for a MULTI-LAP test (the DEGRADED path when
+        telemetry channels aren't live). Three outcomes:
+          IMPROVED (beat best by > LAP_IMPROVE_EPS, above noise) -> KEEP; reset the
+            levers' no-improvement counters; remember their improving values.
+          REGRESSED (> the noise-aware regress gate) -> REVERT + lock the group AND
+            the lever-keys.
+          NEUTRAL (in between) -> REVERT (do NOT bank drift) + bump the no-improvement
+            counter; at LEVER_NOIMPROVE_CAP, lock the lever and roll back to its last
+            improving value (so a slip-chasing diff settles, not drifts to the floor).
+        A locked lever no longer fires, so the loop can actually converge."""
         best = self.best_segment
         if best is None:
             self.best_segment = test_time
@@ -538,44 +1030,145 @@ class Controller:
             self.state.iteration += 1
             return
         delta = test_time - best
-        gate = max(rules.SEGMENT_REGRESS_S, noise)
+        gate = max(rules.SEGMENT_REGRESS_S, noise)   # regress threshold is noise-aware
+        improve_eps = rules.LAP_IMPROVE_EPS          # fixed bar (best-of-N already de-noises)
         has_evidence = any(rules._kind_of(r.lever_group) == "evidence"
                            for r in self._applied_records)
         revert_gate = gate + (ADAPTIVE_EVIDENCE_MARGIN if has_evidence else 0.0)
         n = len(self._applied_records)
-        if delta > revert_gate:
+        keys = self._batch_lever_keys()
+        for r in self._applied_records:           # audit trail: record the after-time
+            r.seg_before_s = best
+            r.seg_after_s = test_time
+
+        if delta < -improve_eps:
+            # IMPROVED - bank it; these levers are making real progress.
+            self._keep_batch(test_time)
+            self.log(f"[fitness] batch ({n}) improved {delta:+.2f}s (> {improve_eps:.2f}) - kept.")
+        elif delta > revert_gate:
+            # REGRESSED - revert and lock (group + each lever-key).
+            self._revert_batch()
+            for r in self._applied_records:
+                self.state.mark_converged(r.lever_group)
+            for key, _fld, _prev in keys:
+                self._lever_locked.add(key)
+            self.stale += 1
+            _laplog.info("ANTI-FIXATION: batch regressed %+.2fs (> gate %.2f) - REVERTED and "
+                         "LOCKED levers %s.", delta, revert_gate, sorted({k for k, _, _ in keys}))
+            self.log(f"[fitness] BATCH ({n}) regressed {delta:+.2f}s > gate {revert_gate:.2f}"
+                     f"{' (+evidence margin)' if has_evidence else ''} - reverted & locked.")
+        else:
+            # NEUTRAL - do NOT bank drift: revert, and count it against each lever.
+            self._revert_batch()
+            self.stale += 1
+            self.log(f"[fitness] batch ({n}) {delta:+.2f}s NEUTRAL (no gain > {improve_eps:.2f}) "
+                     "- reverted (not banked); counting against the lever(s).")
+            self._count_and_lock(keys, delta)
+        self._lock_bottoming_if_no_improve(delta < -improve_eps, delta)
+        self._last_improvement = best - test_time
+        self._applied_records = []
+        self.state.iteration += 1
+
+    def _reset_test(self):
+        self._test_laps = []
+        self._test_packets = []
+        self._best_lap_time = None
+        self._best_lap_stats = None
+        self._best_lap_reading = None
+
+    def _batch_lever_keys(self):
+        """(lever_key, field, previous_value) for every field in the applied batch."""
+        out = []
+        for r in self._applied_records:
+            for fld, new in r.fields.items():
+                out.append((rules.lever_key(fld, r.previous.get(fld, new), new),
+                            fld, r.previous.get(fld, new)))
+        return out
+
+    def _apply_fitness_multi(self, test_time: float, noise: float):
+        """Keep/revert the batch from a MULTI-LAP test. Three outcomes (the lap-time
+        gate is the final authority):
+          IMPROVED (beat best by > LAP_IMPROVE_EPS, above noise) -> KEEP; reset the
+            levers' no-improvement counters; remember their improving values.
+          REGRESSED (> the noise-aware regress gate) -> REVERT + lock the group AND
+            the lever-keys.
+          NEUTRAL (in between) -> REVERT (do NOT bank drift) + bump the no-improvement
+            counter; at LEVER_NOIMPROVE_CAP, lock the lever and roll back to its last
+            improving value (so a slip-chasing diff settles, not drifts to the floor).
+        A locked lever no longer fires, so the loop can actually converge."""
+        best = self.best_segment
+        if best is None:
+            self.best_segment = test_time
+            self._baseline_lap_s = test_time
+            self.state.iteration += 1
+            return
+        delta = test_time - best
+        gate = max(rules.SEGMENT_REGRESS_S, noise)   # regress threshold is noise-aware
+        improve_eps = rules.LAP_IMPROVE_EPS          # fixed bar (best-of-N already de-noises)
+        has_evidence = any(rules._kind_of(r.lever_group) == "evidence"
+                           for r in self._applied_records)
+        revert_gate = gate + (ADAPTIVE_EVIDENCE_MARGIN if has_evidence else 0.0)
+        n = len(self._applied_records)
+        keys = self._batch_lever_keys()
+        for r in self._applied_records:           # audit trail: record the after-time
+            r.seg_before_s = best
+            r.seg_after_s = test_time
+
+        if delta < -improve_eps:
+            # IMPROVED - bank it; these levers are making real progress.
+            for r in self._applied_records:
+                r.verdict = "kept"
+            self.best_segment = test_time
+            self.stale = 0
+            for key, fld, _prev in keys:
+                self._noimprove[key] = 0
+                self._last_improving[fld] = self.state.current.get(fld)
+            self.log(f"[fitness] batch ({n}) improved {delta:+.2f}s (> {improve_eps:.2f}) - kept.")
+        elif delta > revert_gate:
+            # REGRESSED - revert and lock (group + each lever-key).
             for r in reversed(self._applied_records):
                 for k, v in r.previous.items():
                     self.state.current.set(k, v)
                 r.verdict = "reverted"
                 self.state.mark_converged(r.lever_group)
+            for key, _fld, _prev in keys:
+                self._lever_locked.add(key)
             self.stale += 1
+            _laplog.info("ANTI-FIXATION: batch regressed %+.2fs (> gate %.2f) - REVERTED and "
+                         "LOCKED levers %s.", delta, revert_gate, sorted({k for k, _, _ in keys}))
             self.log(f"[fitness] BATCH ({n}) regressed {delta:+.2f}s > gate {revert_gate:.2f}"
                      f"{' (+evidence margin)' if has_evidence else ''} - reverted & locked.")
-        elif delta < -gate:
-            for r in self._applied_records:
-                r.verdict = "kept"
-            self.best_segment = min(best, test_time)
-            self.stale = 0
-            self.log(f"[fitness] batch ({n}) improved {delta:+.2f}s (noise {noise:.2f}) - kept.")
         else:
-            for r in self._applied_records:
-                r.verdict = "kept"
-            self.best_segment = min(best, test_time)
+            # NEUTRAL - do NOT bank drift: revert, and count it against each lever.
+            for r in reversed(self._applied_records):
+                for k, v in r.previous.items():
+                    self.state.current.set(k, v)
+                r.verdict = "reverted"
             self.stale += 1
-            self.log(f"[fitness] batch ({n}) {delta:+.2f}s within noise {noise:.2f} - "
-                     "INCONCLUSIVE, holding the change (kept, not locked).")
-        # anti-fixation (gate is the final authority): a bottoming change that
-        # regressed OR didn't clearly improve the lap -> lock that axle's bottoming
-        # remedy so the rule stops re-firing on it (accept the residual, move on).
-        improved = delta < -gate
-        if not improved:
+            self.log(f"[fitness] batch ({n}) {delta:+.2f}s NEUTRAL (no gain > {improve_eps:.2f}) "
+                     "- reverted (not banked); counting against the lever(s).")
+            for key, fld, _prev in keys:
+                self._noimprove[key] = self._noimprove.get(key, 0) + 1
+                _laplog.info("ANTI-FIXATION: lever '%s' no-improvement %d/%d (delta %+.2fs).",
+                             key, self._noimprove[key], rules.LEVER_NOIMPROVE_CAP, delta)
+                if self._noimprove[key] >= rules.LEVER_NOIMPROVE_CAP \
+                        and key not in self._lever_locked:
+                    self._lever_locked.add(key)
+                    roll = self._last_improving.get(fld, self.state.current.get(fld))
+                    self.state.current.set(fld, roll)
+                    _laplog.info("ANTI-FIXATION: lever '%s' hit the no-improve cap (%d) - "
+                                 "LOCKED and ROLLED BACK %s to its last improving value %.2f.",
+                                 key, rules.LEVER_NOIMPROVE_CAP, fld, roll)
+                    self.log(f"[anti-fixation] {fld} ({key.split(':')[1]}) made no gain in "
+                             f"{rules.LEVER_NOIMPROVE_CAP} tries - locked at {roll:.2f}; moving on.")
+        # bottoming symptom cap (special case): a bottoming change that didn't clearly
+        # improve also locks that axle's WHOLE remedy (ride->bump->spring escalation).
+        if not (delta < -improve_eps):
             for axle in self._cur_bottoming_axles:
                 if axle not in self._bottoming_locked:
                     self._bottoming_locked.add(axle)
-                    _laplog.info("ANTI-FIXATION: %s bottoming change did not improve the lap "
-                                 "(%+.2fs) - GATE locking the axle; stop re-firing that rule.",
-                                 axle, delta)
+                    _laplog.info("ANTI-FIXATION: %s bottoming change did not improve "
+                                 "(%+.2fs) - GATE locking the axle's whole remedy.", axle, delta)
                     self.log(f"[anti-fixation] {axle} bottoming change didn't help "
                              f"({delta:+.2f}s) - locked; moving to other levers.")
         self._cur_bottoming_axles = set()
@@ -775,7 +1368,8 @@ class Controller:
             ride_locked=self.ride_locked, max_search=self.changes_per_test,
             bottoming_locked=self._bottoming_locked,
             step_mult=rules.step_mult_for(self.aggressiveness),
-            bottoming_attempts=self._bottoming_attempts)
+            bottoming_attempts=self._bottoming_attempts,
+            lever_locked=self._lever_locked)
         if not self.batch:
             if self.stale >= 2 or self.best_segment is None:
                 self.phase = DONE
@@ -808,12 +1402,36 @@ class Controller:
         full lap measures the whole batch. MANUAL: time the same segment again."""
         if not self.batch:
             return
+        # A/B/A confirmed B beats the re-measured baseline: the user re-enters B's
+        # values; accept WITHOUT another measurement (we already confirmed the gain).
+        if self.batch[0].group == "confirm_reapply":
+            for rec in self.batch:
+                self.state.apply_change(rec.group, rec.fields, rec.reason, rec.feel_for)
+                self._on_car.update(rec.fields)        # user physically re-entered B
+            keep = self._aba_keep or {}
+            self._aba_keep = None
+            if keep.get("b_telem") is not None and getattr(keep["b_telem"], "live", False):
+                self._ref_telem = keep["b_telem"]
+            bt = keep.get("b_time")
+            if bt is not None and (self.best_segment is None or bt < self.best_segment):
+                self.best_segment = bt
+            self.stale = 0
+            self.batch = []
+            self._applied_records = []
+            self.state.iteration += 1
+            self.log("[A/B/A] confirmed change re-applied and kept; continuing.")
+            self._next_step()
+            return
         self._reset_test()                 # a new change starts a fresh multi-lap test
         self._applied_records = []
         for rec in self.batch:
             applied = self.state.apply_change(rec.group, rec.fields, rec.reason, rec.feel_for)
             applied.seg_before_s = self.best_segment
             self._applied_records.append(applied)
+            self._on_car.update(rec.fields)            # user physically entered these
+        if self.batch[0].group == "final_baseline":
+            # instruction-only rec; the user re-enters the baseline tune by hand
+            self._on_car = self.baseline.as_dict() if self.baseline else self._on_car
         if self.mode == MODE_AUTO:
             self._awaiting_test = True
             self._await_state = "out_lap"
@@ -845,9 +1463,12 @@ class Controller:
         store.save_session(self.state, car=m["car"], car_class=m["car_class"],
                            discipline=self.discipline, front_weight_pct=self.front_weight_pct,
                            drivetrain=m["drivetrain"], baseline=self.baseline, stats_log=[],
-                           started_iso=self.started_iso, status="converged",
+                           started_iso=self.started_iso,
+                           status=(self.stop_reason or "converged"),
                            limits=self.limits, best_lap_s=self.best_segment,
                            finished_iso=finished_iso)
+        if self.final_verdict:
+            self.log(self.final_verdict)
         # shareable value sheet (.txt + optn block) + clean JSON, in the known folder
         self.export = store.export_tune(
             self.state, car=m["car"], car_class=m["car_class"], discipline=self.discipline,
@@ -1091,6 +1712,13 @@ class Controller:
             "discipline": self.discipline,
             "iteration": self.state.iteration if self.state else 0,
             "best_segment_s": self.best_segment,
+            "ui": self.ui_state(),
+            "budget_min": self.time_budget_min or None,
+            "budget_remaining_s": self.budget_remaining_s(),
+            "budget_expired": self._budget_expired,
+            "rigour": self.rigour,
+            "stop_reason": self.stop_reason or None,
+            "final_verdict": self.final_verdict or None,
             "live": live,
             "change": change,
             "batch": batch,

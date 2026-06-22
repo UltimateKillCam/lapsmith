@@ -213,15 +213,17 @@ def main(argv=None) -> int:
 
     # Persist user-assigned car names + saved tunes under the app data dir.
     from .. import ordinals
-    from ..state import store
+    from ..state import store, prefs
     data_dir = _log_dir()
     n = ordinals.set_store_path(os.path.join(data_dir, "car_names.json"))
     store.set_sessions_dir(os.path.join(data_dir, "sessions"))
+    prefs.set_store_path(os.path.join(data_dir, "prefs.json"))
     capture.CAPTURE_DIR = os.path.join(data_dir, "captures")   # Heat frames under the data dir
     log.info("loaded %d saved car name(s); tunes -> %s", n, store.SESSIONS_DIR)
 
     ctrl = C.Controller(port=args.port,
                         started_iso=_dt.datetime.now().isoformat(timespec="seconds"))
+    ctrl.time_budget_min = prefs.time_budget_min()   # persisted ceiling (default 20)
     ctrl.start()
     ctrl.log(f"Listening on 127.0.0.1:{args.port}. Enable Data Out + borderless windowed.")
     ctrl.log(f"Log file: {logfile}")
@@ -418,18 +420,23 @@ def main(argv=None) -> int:
             ctrl.reset_session()                       # clean slate for a new car/run
             ctrl.confirm_car()                         # prompts for a name if unknown
             res = setup_form.show_setup_dialog(ctrl.identity.summary(),
-                                               ctrl.identity.class_letter)
+                                               ctrl.identity.class_letter,
+                                               time_budget_default=prefs.time_budget_min())
             if not res:
                 ctrl.log("Setup cancelled.")
                 ctrl.phase = C.WAIT_TELEMETRY
                 return
+            if res.get("time_budget_min") is not None:    # share with the main-window control
+                prefs.set("time_budget_min", float(res["time_budget_min"]))
             ctrl.apply_setup(res["discipline"], res["limits"], res["front_weight"],
                              changes_per_test=res["changes_per_test"],
                              laps_per_test=res["laps_per_test"], lap_agg=res["lap_agg"],
                              temp_mode=res.get("temp_mode"),
                              use_vision_api=res.get("use_vision_api"),
                              target_class=res.get("target_class"),
-                             aggressiveness=res.get("aggressiveness"))
+                             aggressiveness=res.get("aggressiveness"),
+                             rigour=res.get("rigour"),
+                             time_budget_min=res.get("time_budget_min"))
             done_box["bundled"] = False
             log.info("setup applied: %s -> phase=%s",
                      {k: v for k, v in res.items() if k != "limits"}, ctrl.phase)

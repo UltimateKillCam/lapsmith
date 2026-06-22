@@ -260,6 +260,52 @@ def _spring_pair(disc: str) -> tuple[float, float]:
 # --- pretty printing --------------------------------------------------------
 
 
+# field -> (human label as it reads in the in-game tune menu, value format). Single
+# source of truth for every "change THESE values" checklist (apply / revert / final).
+FIELD_LABELS = {
+    "tyre_compound":    ("Compound", "{}"),
+    "pressure_f":       ("Pressure Front", "{:.1f} psi"),
+    "pressure_r":       ("Pressure Rear", "{:.1f} psi"),
+    "camber_f":         ("Camber Front", "{:+.1f} deg"),
+    "camber_r":         ("Camber Rear", "{:+.1f} deg"),
+    "toe_f":            ("Toe Front", "{:+.1f} deg"),
+    "toe_r":            ("Toe Rear", "{:+.1f} deg"),
+    "caster":           ("Caster", "{:.1f} deg"),
+    "arb_f":            ("ARB Front", "{:.0f}"),
+    "arb_r":            ("ARB Rear", "{:.0f}"),
+    "spring_f":         ("Spring Front", "{:.1f} kgf/mm"),
+    "spring_r":         ("Spring Rear", "{:.1f} kgf/mm"),
+    "ride_height_f":    ("Ride Height Front", "{:.1f} cm"),
+    "ride_height_r":    ("Ride Height Rear", "{:.1f} cm"),
+    "rebound_f":        ("Rebound Front", "{:.1f}"),
+    "rebound_r":        ("Rebound Rear", "{:.1f}"),
+    "bump_f":           ("Bump Front", "{:.1f}"),
+    "bump_r":           ("Bump Rear", "{:.1f}"),
+    "brake_pressure":   ("Brake Pressure", "{:.0f} %"),
+    "brake_balance":    ("Brake Balance", "{:.0f} % front"),
+    "diff_center":      ("Center diff (to rear)", "{:.0f} %"),
+    "diff_rear_accel":  ("Rear Accel diff", "{:.0f} %"),
+    "diff_rear_decel":  ("Rear Decel diff", "{:.0f} %"),
+    "diff_front_accel": ("Front Accel diff", "{:.0f} %"),
+    "diff_front_decel": ("Front Decel diff", "{:.0f} %"),
+    "aero_front":       ("Aero Front", "{:.0f}"),
+    "aero_rear":        ("Aero Rear", "{:.0f}"),
+    "final_drive":      ("Final Drive", "{:.2f}"),
+}
+
+
+def field_label(field: str) -> str:
+    return FIELD_LABELS.get(field, (field, "{}"))[0]
+
+
+def fmt_field(field: str, value) -> str:
+    fmt = FIELD_LABELS.get(field, (field, "{}"))[1]
+    try:
+        return fmt.format(value)
+    except (ValueError, TypeError):
+        return str(value)
+
+
 def format_checklist(t: Tune, car: str, car_class: str, discipline: str,
                      front_weight_pct: float, drivetrain: str) -> str:
     cls = canon_class(car_class)

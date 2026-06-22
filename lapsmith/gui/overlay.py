@@ -291,31 +291,54 @@ def _render_tune(st: dict) -> str:
     if sc:
         P.append(f"<div style='font-size:11px;margin:1px 0 3px'>{sc} "
                  f"<span style='color:#5a6273'>[F6] {st.get('view_mode','simple')}</span></div>")
-    # 2. colour-coded plain-language STATE
-    label, color = _state_badge(st)
-    P.append(f"<div style='font-size:17px;font-weight:800;color:{color};margin:5px 0'>"
-             f"&#9679; {_esc(label)}</div>")
     if st.get("error"):
         P.append("<div style='color:#ff6b6b;font-weight:700;margin:2px 0'>"
                  f"&#9888; ERROR: {_esc(str(st['error']))}</div>")
-    # 3. the recommended change(s) for THIS LAP
-    batch = st.get("batch") or []
-    if batch:
-        P.append("<div style='font-size:13px;font-weight:700;margin:3px 0'>THIS LAP - "
-                 "set all in the Tune menu:</div>")
-        for r in batch:
-            tag = "" if r["kind"] == "evidence" else " <span style='color:#c9a'>(search)</span>"
-            P.append(f"<div style='font-size:13px;color:#ffd479'>&bull; "
-                     f"<b>{_esc(r['detail'] or r['group'])}</b>{tag}</div>")
-            if advanced and r.get("reason"):     # WHY, in advanced view
-                P.append(f"<div style='font-size:11px;color:#b9c;margin-left:10px'>"
-                         f"{_esc(r['reason'])}</div>")
-    # 4. ONE prominent WHAT TO DO NOW line (the guided action)
-    hint = (step.get("action") if step else "") or _hint(st)
-    if hint:
-        P.append("<div style='font-size:13px;font-weight:700;color:#0c0e12;"
-                 "background:#ffd479;border-radius:6px;padding:6px 8px;margin:6px 0'>"
-                 f"&#9654; {_esc(hint)}</div>")
+    # 2+3+4. UNMISTAKABLE state: ACTION (edit the menu) vs DRIVE (touch nothing) vs DONE.
+    # Colour + header verb + presence/absence of the checklist make a timed measuring
+    # lap impossible to confuse with a go-to-the-menu prompt.
+    ui = st.get("ui") or {}
+    klass = ui.get("klass", "info")
+    if klass == "action":
+        # AMBER, bold header, then the exact field->value checklist, then "press F8".
+        amber, ink = "#f2b134", "#0c0e12"
+        P.append(f"<div style='background:{amber};color:{ink};border-radius:7px;"
+                 "padding:7px 9px;margin:5px 0'>"
+                 f"<div style='font-size:16px;font-weight:900'>&#9888; {_esc(ui.get('header',''))}</div>")
+        cl = ui.get("checklist") or []
+        for item in cl:
+            P.append("<div style='font-size:14px;font-weight:700;margin:3px 0 0'>&bull; "
+                     f"{_esc(item['label'])}: <span style='color:#7a1f1f'>{_esc(item['from'])}</span> "
+                     f"&#8594; <b>{_esc(item['to'])}</b></div>")
+        if advanced:
+            for r in (st.get("batch") or []):
+                if r.get("reason"):
+                    P.append("<div style='font-size:11px;color:#3a2f10;margin-left:10px'>"
+                             f"{_esc(r['reason'])}</div>")
+        P.append("<div style='font-size:13px;font-weight:800;margin-top:5px'>"
+                 "&#9654; press F8 when applied</div></div>")
+    elif klass == "drive":
+        # GREEN/BLUE, passive wording, NO checklist - do not touch anything.
+        green = "#4fcc4f"
+        P.append(f"<div style='font-size:17px;font-weight:800;color:{green};margin:5px 0'>"
+                 f"&#9679; {_esc(ui.get('header',''))}</div>")
+        if ui.get("sub"):
+            P.append(f"<div style='font-size:12px;color:#9fd9a0'>{_esc(ui['sub'])}</div>")
+    elif klass == "done":
+        col = "#f2b134" if ui.get("header", "").startswith("TIME BUDGET") else "#4fcc4f"
+        P.append(f"<div style='font-size:17px;font-weight:800;color:{col};margin:5px 0'>"
+                 f"&#9679; {_esc(ui.get('header',''))}</div>")
+        if ui.get("sub"):
+            P.append(f"<div style='font-size:12px;color:#cde'>{_esc(ui['sub'])}</div>")
+    else:
+        label, color = _state_badge(st)
+        P.append(f"<div style='font-size:17px;font-weight:800;color:{color};margin:5px 0'>"
+                 f"&#9679; {_esc(label)}</div>")
+        hint = (step.get("action") if step else "") or _hint(st)
+        if hint:
+            P.append("<div style='font-size:13px;font-weight:700;color:#0c0e12;"
+                     "background:#ffd479;border-radius:6px;padding:6px 8px;margin:6px 0'>"
+                     f"&#9654; {_esc(hint)}</div>")
     # 5. progress + best / last / iteration
     tgt = st.get("test_target")
     if tgt and tgt > 1:
@@ -330,6 +353,15 @@ def _render_tune(st: dict) -> str:
     if st.get("last_lap_s"):
         bits.append(f"last {st['last_lap_s']:.2f}s")
     P.append(f"<div style='color:#cde;font-size:12px'>{' &nbsp;|&nbsp; '.join(bits)}</div>")
+    # time budget countdown (real wall-clock from the first Rivals lap)
+    rem = st.get("budget_remaining_s")
+    if st.get("budget_expired"):
+        P.append("<div style='font-size:12px;font-weight:700;color:#f2b134'>"
+                 "Time budget reached - finishing current test</div>")
+    elif rem is not None:
+        col = "#f2b134" if rem <= 120 else "#9cf"
+        P.append(f"<div style='font-size:12px;color:{col}'>time budget: "
+                 f"{int(rem // 60)}:{int(rem % 60):02d} left</div>")
     # 6. DONE: where the shareable files are
     exp = st.get("export")
     if exp:

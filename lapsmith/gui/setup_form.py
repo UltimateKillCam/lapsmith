@@ -21,7 +21,8 @@ def _val(spin) -> Optional[float]:
 
 
 def show_setup_dialog(detected_summary: str = "",
-                      detected_class: str = "") -> Optional[dict]:
+                      detected_class: str = "",
+                      time_budget_default: float = 20.0) -> Optional[dict]:
     try:
         from PySide6 import QtWidgets
     except Exception as e:  # pragma: no cover
@@ -92,6 +93,32 @@ def show_setup_dialog(detected_summary: str = "",
     aggro.setCurrentIndex(1)        # Normal
     form.addRow("Change aggressiveness", aggro)
 
+    rigour = QtWidgets.QComboBox()
+    rigour.addItems(["Confirmed (A/B/A)", "Quick (single pass)"])
+    rigour.setCurrentIndex(0)       # Confirmed by default
+    rigour.setToolTip(
+        "How hard a change must prove itself before it is kept.\n"
+        "Confirmed (recommended): when a change looks faster, the tool reverts to the "
+        "previous tune and re-measures (A/B/A) before keeping it - so a gain that was "
+        "really just you learning the track is discarded, not banked.\n"
+        "Quick: single measurement per change (faster, less rigorous) - still re-anchors "
+        "and runs the honest final check, but flags drift instead of confirming it.")
+    form.addRow("Test rigour", rigour)
+
+    budget = QtWidgets.QSpinBox()
+    budget.setRange(0, 240)
+    budget.setValue(int(time_budget_default))   # persisted default (main window shares it)
+    budget.setSpecialValueText("Unlimited / off")   # shown when value == 0
+    budget.setSuffix(" min")
+    budget.setToolTip(
+        "Real wall-clock budget for the whole session. The clock starts on your FIRST "
+        "Rivals lap and runs continuously - including loading screens, menu time and "
+        "applying tune changes; it is never paused. Past ~20 minutes the gains go "
+        "marginal, so this stops the loop. On expiry it finishes the test in progress "
+        "(no half-tested change), runs the honest final check, then stops.\n"
+        "Set to 0 for Unlimited / off.")
+    form.addRow("Tuning time budget", budget)
+
     tmode = QtWidgets.QComboBox()
     tmode.addItems(["Auto, local OCR (rec.)", "Manual entry each lap"])
     form.addRow("Tyre temps", tmode)
@@ -106,7 +133,7 @@ def show_setup_dialog(detected_summary: str = "",
 
     # Let the combos shrink instead of dictating the dialog width by their longest
     # item: size to a modest content length (the popup still shows full text).
-    for c in (target, disc, cpt, lpt, agg, aggro, tmode):
+    for c in (target, disc, cpt, lpt, agg, aggro, rigour, tmode):
         c.setSizeAdjustPolicy(
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         c.setMinimumContentsLength(22)
@@ -181,4 +208,6 @@ def show_setup_dialog(detected_summary: str = "",
             "laps_per_test": laps, "lap_agg": "median" if agg.currentIndex() == 1 else "best",
             "temp_mode": "manual" if tmode.currentIndex() == 1 else "auto",
             "aggressiveness": ("fine", "normal", "coarse")[aggro.currentIndex()],
+            "rigour": "quick" if rigour.currentIndex() == 1 else "confirmed",
+            "time_budget_min": float(budget.value()),   # 0 = unlimited
             "use_vision_api": bool(vapi.isChecked())}

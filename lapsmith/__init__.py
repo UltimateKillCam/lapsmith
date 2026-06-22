@@ -1,4 +1,4 @@
-"""LapSmith - a telemetry-driven auto-tuning assistant for Forza Horizon 6."""
+﻿"""LapSmith - a telemetry-driven auto-tuning assistant for Forza Horizon 6."""
 
 import os
 import sys
@@ -6,7 +6,7 @@ import sys
 # The single source of truth for the product name. Use this for ALL user-facing
 # strings (window titles, overlay header, dialogs, tray, help, file headers).
 PRODUCT_NAME = "LapSmith"
-__version__ = "0.1.6"
+__version__ = "0.1.9"
 
 
 def resource_path(rel: str) -> str:

@@ -51,20 +51,48 @@ ARB_REAR_SOFT_FLOOR = 60.0   # if rear already >= this, adjust front instead
 # E. diff
 DIFF_STEP = 5.0
 DIFF_CENTER_MAX = 90.0
-ON_POWER_OS_SLIP = 0.30   # on-throttle rear slip ratio that flags power oversteer
-EXIT_US_FRONT_SLIP = 0.25 # on-throttle front slip ratio (AWD push)
-ENTRY_INSTAB_SLIP = 0.30  # braking rear slip ratio that flags entry instability
+# On-throttle slip-ratio triggers are TARMAC values. On dirt/CC that wheelspin is
+# WANTED, so the thresholds are discipline-keyed (much higher off-road) the same
+# way BOTTOM_THRESH is - normal dirt slip (0.4-0.5) must NOT read as a fault.
+ON_POWER_OS_SLIP = 0.30        # road: on-throttle rear slip ratio -> power oversteer
+ON_POWER_OS_SLIP_DIRT = 0.60   # dirt/CC: only flag well past normal wheelspin
+EXIT_US_FRONT_SLIP = 0.25      # road: on-throttle front slip ratio (AWD push)
+EXIT_US_FRONT_SLIP_DIRT = 0.50
+ENTRY_INSTAB_SLIP = 0.30       # road: braking rear slip ratio (entry instability)
+ENTRY_INSTAB_SLIP_DIRT = 0.55
+# Driveability floor: on dirt the lap-time gate can't see that an open rear diff
+# kills drive/powerslide, so never let the accel diff fall below this % off-road.
+DIRT_ACCEL_DIFF_FLOOR = 50.0
 # F. gearing
 FINAL_DRIVE_STEP = 0.10
 LOW_EXIT_RPM_FRAC = 0.70
 # G. aero
 AERO_STEP_FRAC = 0.10     # 10% of range
 AERO_RANGE = 1000.0       # assumed menu range for the 10% step
-# fitness gate (tool-side free-roam segment time, seconds)
-SEGMENT_REGRESS_S = 0.2
+# fitness gate (lap/segment time, seconds)
+SEGMENT_REGRESS_S = 0.2   # regress past this (noise-aware) -> revert + lock the lever
+LAP_REGRESS_S = SEGMENT_REGRESS_S         # alias: the regression threshold
+LAP_IMPROVE_EPS = 0.10    # must beat the best lap by THIS (above noise) to count as
+                          # a real improvement; smaller deltas are NEUTRAL (reverted)
+# Anti-fixation: max consecutive NON-IMPROVING attempts on ONE lever (field +
+# direction) before it is locked and rolled back to its last improving value.
+LEVER_NOIMPROVE_CAP = 2
+
+# --- drift-robust methodology (a single, driver-confounded lap is too weak) -----
+LAPS_PER_TEST = 2              # clean green laps aggregated into ONE measurement
+WARMUP_LAPS = 2               # cold/learning laps before the first baseline anchor
+BASELINE_REANCHOR_EVERY = 3   # re-measure the accepted tune every N iterations
+# wall-clock session budget (real minutes from the first Rivals lap; 0 = unlimited)
+DEFAULT_TIME_BUDGET_MIN = 20
 
 # road-discipline disciplines for which the road pressure band applies
 _ROAD_LIKE = {"road", "touge", "topspeed", "drag"}
+_DIRT_LIKE = {"dirt", "cc"}
+
+
+def _diff_slip_thresh(disc: str, road_val: float, dirt_val: float) -> float:
+    """Discipline-keyed slip-ratio threshold (dirt/CC tolerate far more wheelspin)."""
+    return dirt_val if disc in _DIRT_LIKE else road_val
 
 
 @dataclass
@@ -90,6 +118,28 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def lever_key(field: str, old: float, new: float) -> str:
+    """Identity of a tuning move for the anti-fixation cap: the lever FIELD plus the
+    DIRECTION of change, e.g. 'diff_rear_accel:down'. Locking this key stops the
+    loop re-firing that exact lever in that direction."""
+    return f"{field}:{'down' if new < old else 'up'}"
+
+
+def _filter_locked_levers(rec: "Recommendation", tune: Tune,
+                          lever_locked) -> Optional["Recommendation"]:
+    """Drop fields whose (field, direction) move is LOCKED (capped by the gate); if
+    every field is locked the rule produced nothing usable -> None (so it does NOT
+    count as 'a rule fired' and the loop can converge)."""
+    if not lever_locked:
+        return rec
+    kept = {f: v for f, v in rec.fields.items()
+            if lever_key(f, tune.get(f), v) not in lever_locked}
+    if not kept:
+        return None
+    rec.fields = kept
+    return rec
+
+
 def _round(v: float, q: float = 0.1) -> float:
     return round(round(v / q) * q, 3)
 
@@ -98,7 +148,8 @@ def analyze(stats: TestStats, tune: Tune, discipline: str,
             tyre_reading: Optional[Dict[str, Dict[str, float]]] = None,
             converged: Optional[set] = None,
             limits: Optional[CarLimits] = None,
-            ride_locked: Optional[set] = None) -> Recommendation:
+            ride_locked: Optional[set] = None,
+            lever_locked: Optional[set] = None) -> Recommendation:
     """Return the single next change, or CONVERGED if nothing fires.
 
     `tyre_reading` is the 3-zone tyre-temp page read (per tyre inner/mid/outer
@@ -126,6 +177,9 @@ def analyze(stats: TestStats, tune: Tune, discipline: str,
         if not rec or not rec.is_change() or rec.group in converged:
             continue
         rec = _apply_limits(rec, tune, limits)
+        if rec is None:
+            continue
+        rec = _filter_locked_levers(rec, tune, lever_locked)
         if rec is not None:
             return rec
     return CONVERGED
@@ -158,7 +212,8 @@ def analyze_batch(stats: TestStats, tune: Tune, discipline: str,
                   max_search: int = 1,
                   bottoming_locked: Optional[set] = None,
                   step_mult: float = 1.0,
-                  bottoming_attempts: Optional[dict] = None) -> List[Recommendation]:
+                  bottoming_attempts: Optional[dict] = None,
+                  lever_locked: Optional[set] = None) -> List[Recommendation]:
     """Build a BATCH for one test lap: ALL firing evidence-driven changes (each
     justified by its own measurement) plus up to `max_search` search-driven
     (handling-cluster) changes. Returns [] if nothing fires.
@@ -193,6 +248,9 @@ def analyze_batch(stats: TestStats, tune: Tune, discipline: str,
         rec = _apply_limits(rec, work, limits)
         if rec is None:
             continue
+        rec = _filter_locked_levers(rec, work, lever_locked)
+        if rec is None:
+            continue                        # all fields locked -> not "a rule fired"
         rec.kind = _kind_of(rec.group)
         for k, v in rec.fields.items():     # accumulate so later rules see it
             work.set(k, v)
@@ -507,18 +565,25 @@ def _rule_damping(stats, tune, disc, tyre_reading, road_band, limits) -> Optiona
 
 # --- E. diff ----------------------------------------------------------------
 def _rule_diff(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[Recommendation]:
-    # on-power oversteer: rear slip rising on throttle
-    if stats.on_throttle_rear_slip > ON_POWER_OS_SLIP and \
+    os_thresh = _diff_slip_thresh(disc, ON_POWER_OS_SLIP, ON_POWER_OS_SLIP_DIRT)
+    us_thresh = _diff_slip_thresh(disc, EXIT_US_FRONT_SLIP, EXIT_US_FRONT_SLIP_DIRT)
+    entry_thresh = _diff_slip_thresh(disc, ENTRY_INSTAB_SLIP, ENTRY_INSTAB_SLIP_DIRT)
+    # dirt/CC keep a driveability floor on the accel diff (open rear = no drive)
+    accel_floor = DIRT_ACCEL_DIFF_FLOOR if disc in _DIRT_LIKE else 0.0
+    # on-power oversteer: rear slip rising on throttle (threshold is dirt-aware)
+    if stats.on_throttle_rear_slip > os_thresh and \
             stats.on_throttle_rear_slip > stats.on_throttle_front_slip:
-        new = _clamp(tune.diff_rear_accel - DIFF_STEP, 0.0, 100.0)
+        new = _clamp(tune.diff_rear_accel - DIFF_STEP, accel_floor, 100.0)
         if new != tune.diff_rear_accel:
+            floor_note = (f" (dirt floor {accel_floor:.0f}% - moderate wheelspin is the "
+                          "target, not a fault)" if accel_floor else "")
             return Recommendation("diff", {"diff_rear_accel": _round(new, 1)},
                 f"On-power oversteer: rear slip ratio {stats.on_throttle_rear_slip:.2f} "
-                f"under throttle (> {ON_POWER_OS_SLIP}).",
+                f"under throttle (> {os_thresh}).",
                 "Cleaner corner exits; rear lays power down without stepping out.",
-                f"Rear accel diff {tune.diff_rear_accel:.0f} -> {new:.0f} %")
+                f"Rear accel diff {tune.diff_rear_accel:.0f} -> {new:.0f} %{floor_note}")
     # AWD exit understeer: front slip rising on throttle -> send more torque rear
-    if stats.drivetrain == "AWD" and stats.on_throttle_front_slip > EXIT_US_FRONT_SLIP \
+    if stats.drivetrain == "AWD" and stats.on_throttle_front_slip > us_thresh \
             and stats.on_throttle_front_slip > stats.on_throttle_rear_slip:
         new = _clamp(tune.diff_center + DIFF_STEP, 0.0, DIFF_CENTER_MAX)
         if new != tune.diff_center:
@@ -528,7 +593,7 @@ def _rule_diff(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[R
                 "Nose stops pushing on exit; more drive comes from the rear.",
                 f"Center diff {tune.diff_center:.0f} -> {new:.0f} % to rear")
     # entry instability under braking
-    if stats.braking_rear_slip > ENTRY_INSTAB_SLIP:
+    if stats.braking_rear_slip > entry_thresh:
         new = _clamp(tune.diff_rear_decel - DIFF_STEP, 0.0, 100.0)
         if new != tune.diff_rear_decel:
             return Recommendation("diff", {"diff_rear_decel": _round(new, 1)},

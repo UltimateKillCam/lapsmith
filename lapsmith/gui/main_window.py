@@ -36,9 +36,54 @@ wide the slider search ranges should be.</li>
 <li><b>Apply the tune</b> — type the shown values into the in-game tune menu, then load a Rivals event.</li>
 <li><b>Baseline</b> — drive 2 laps. Lap 1 is a warm-up and is ignored; lap 2 sets your baseline.</li>
 <li><b>Make the change</b> — apply the one change LapSmith shows, <b>restart</b> the event, drive 2 laps.</li>
-<li><b>Test</b> — lap 1 warm-up (ignored), lap 2 timed against your best. Faster is kept, slower reverted.</li>
-<li><b>Converged</b> — when nothing more helps, the final tune and shareable files are saved.</li>
+<li><b>Test</b> — lap 1 warm-up (ignored), the next laps measured against your best. A change is kept only
+if the <b>telemetry</b> shows the car really got better (see below), not just because the lap was faster.</li>
+<li><b>Converged</b> — when nothing more helps (or the time budget runs out), LapSmith re-measures your
+ORIGINAL baseline once more for an honest verdict, then saves the final tune and shareable files.</li>
 </ol>
+<h3>How lap times are validated (separating tune gains from driver improvement)</h3>
+<p>Over a session you naturally learn the track and get faster — so a single lap time is a weak, misleading
+signal: a change can look like a win when it was really just you driving better. LapSmith guards against this:</p>
+<ul>
+<li><b>Telemetry-primary fitness.</b> A change is judged mainly on the car's telemetry — cornering grip,
+corner-exit forward-g (how quickly it accelerates off a corner), traction efficiency and corner speed — not
+the raw clock. Lap time is a secondary guardrail.</li>
+<li><b>Track-position binning.</b> Because Rivals is the same track every lap, telemetry is binned by position
+on track, so the <i>same corner</i> is compared across laps. That cancels out driving-line variation.</li>
+<li><b>Multi-lap measurements.</b> Each measurement aggregates a few clean green laps, not one, to beat noise.</li>
+<li><b>A/B/A confirmation</b> (Test rigour = Confirmed). When a change looks faster, LapSmith has you revert
+to the previous tune and re-measure it. If your reverted baseline is now just as quick, the “gain” was you
+improving — so the change is discarded, not banked.</li>
+<li><b>Honest final check.</b> On stop it re-measures your original baseline. If that’s now as fast as the
+“optimised” tune, it reports <i>“net improvement within driver variation — changes not confirmed”</i> rather
+than claiming a tune win.</li>
+</ul>
+<h3>Test rigour &amp; the time budget</h3>
+<ul>
+<li><b>Test rigour</b> (setup) — <b>Confirmed</b> (default) runs the full A/B/A confirmation on apparent wins;
+<b>Quick</b> is a single pass per change (faster, less rigorous) but still re-anchors and runs the honest
+final check, warning you about possible driver drift instead of confirming it.</li>
+<li><b>Max tuning time</b> (default <b>20 min</b>) — a real wall-clock <i>ceiling</i>, started on your FIRST
+Rivals lap and counting continuously, <i>including loading screens, menus and entering tune changes</i> — it
+is never paused. It is a ceiling, not a target: if the tool converges first it stops and saves immediately,
+with time to spare. On expiry it finishes the test in progress (never a half-tested change), runs the honest
+final check, then stops. Set it to <b>0</b> for Unlimited / off. Editable in <b>Settings → Max tuning time
+(minutes)</b> (applies live, even mid-run) and in the setup form — they share one value. The overlay shows
+the time remaining; the saved status reads <i>"converged"</i> or <i>"stopped: time budget"</i> accordingly.</li>
+</ul>
+<h3>Reading the overlay — two kinds of state</h3>
+<p>Every overlay state is one of two clearly different colours so a timed lap can never be mistaken for a
+go-to-the-menu prompt:</p>
+<ul>
+<li><b>Amber — CHANGE THESE NOW.</b> Edit the in-game tune menu. It lists the exact fields and target values
+as <i>from → to</i> (only what must change, including setting a reverted change back), and ends with
+<b>"press F8 when applied"</b>. Used for applying a change, reverting, and re-entering the baseline.</li>
+<li><b>Green — just drive, don't touch anything.</b> No checklist. Sub-states: <b>WARM-UP</b> (not counted),
+<b>OUT-LAP</b> (not counted, get back to the line), <b>MEASURING — lap x/y</b> (a counted timed lap),
+<b>RE-ANCHOR</b> (drive the current tune, no changes), and <b>FINAL CHECK</b> (drive the baseline). If
+everything was already reverted it says <i>"Car is already on the baseline — just drive"</i>.</li>
+<li><b>DONE</b> — <i>converged</i> (tune saved) or <i>TIME BUDGET REACHED</i>.</li>
+</ul>
 <h3>Hotkeys</h3>
 <table>
 <tr><td><b>F8</b></td><td>advance / confirm / apply</td></tr>
@@ -386,6 +431,21 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
                 lambda v: setattr(self.ctrl, "port", int(v)))
             form.addRow("Telemetry port (applies next start)", self.set_port)
 
+            # Max tuning time: the wall-clock CEILING for a run (0 = unlimited). The tool
+            # can still finish earlier if it converges. Shared with the setup form via
+            # prefs (one source of truth) and applied live to a running budget.
+            self.set_budget = QtWidgets.QSpinBox()
+            self.set_budget.setRange(0, 240)
+            self.set_budget.setSuffix(" min")
+            self.set_budget.setSpecialValueText("Unlimited / off")
+            self.set_budget.setValue(int(getattr(self.ctrl, "time_budget_min", 0) or 0))
+            self.set_budget.setToolTip(
+                "Wall-clock ceiling for a tuning run, from your first Rivals lap "
+                "(includes loads/menus; never paused). 0 = unlimited. The tool stops "
+                "earlier if it converges. Changing this applies to a run already going.")
+            self.set_budget.valueChanged.connect(self._set_budget)
+            form.addRow("Max tuning time (minutes)", self.set_budget)
+
             self.set_temp = QtWidgets.QComboBox()
             self.set_temp.addItems(["auto", "manual"])
             self.set_temp.setCurrentText(getattr(self.ctrl, "temp_mode", "auto"))
@@ -474,6 +534,13 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             name = self.names_table.item(r, 1).text() if self.names_table.item(r, 1) else ""
             self.ctrl.rename_car(ordinal, name)
             self._toast(f"Saved #{ordinal} -> {name}")
+
+        def _set_budget(self, minutes):
+            """Apply the Max-tuning-time control: update the live controller budget and
+            persist it (shared with the setup form). 0 = unlimited."""
+            from ..state import prefs
+            self.ctrl.set_time_budget(float(minutes))
+            prefs.set("time_budget_min", float(minutes))
 
         def _toggle_capture(self, checked):
             """Ticking ON requires confirmation (it can let the overlay obscure the

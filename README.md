@@ -40,10 +40,30 @@ Note that Forza only streams telemetry while you're actually on track — nothin
 2. **Apply the tune** — type the shown values into the tune menu, then load a Rivals event.
 3. **Baseline** — drive 2 laps. The first is a warm-up and gets ignored; the second sets your baseline.
 4. **Make the change** — apply the one change it shows, restart the event, drive 2 laps.
-5. **Test** — first lap warm-up, second lap timed against your best. Faster sticks, slower gets reverted.
-6. **Converged** — when nothing more helps, your final tune and the shareable files are saved.
+5. **Test** — first lap warm-up, then a few clean laps measured. A change is kept only if the car's *telemetry* shows it got better (see below), not just because a lap was faster.
+6. **Converged** — when nothing more helps (or the time budget runs out), LapSmith re-measures your original baseline once more for an honest verdict, then saves your final tune and the shareable files.
 
 The hotkeys, settings, and full walkthrough live on the **Help** tab inside the app.
+
+## How lap times are validated (tune gains vs. driver improvement)
+
+Over a session you learn the track and get faster on your own — so a single lap time is a weak, driver-confounded signal: a change can look like a win when it was really just you driving better. LapSmith separates the two:
+
+- **Telemetry-primary fitness.** A change is judged mainly on the car's telemetry — cornering grip, corner-exit forward-g (how quickly it accelerates off a corner), traction efficiency, and corner speed — with lap time as a secondary guardrail (if the telemetry says "better" but the clock is clearly and repeatably worse, the change is rejected).
+- **Track-position binning.** Rivals is the same track every lap, so telemetry is binned by position on track (DistanceTraveled): the *same corner* is compared lap to lap, which cancels driving-line variation.
+- **Multi-lap measurements.** Each measurement aggregates several clean green laps, not one.
+- **A/B/A confirmation** (Test rigour = *Confirmed*, the default): when a change looks faster, LapSmith has you revert to the previous tune and re-measure it. If the reverted baseline is now just as quick, the "gain" was you improving — so the change is discarded. *Quick* rigour does a single pass and warns about drift instead.
+- **Honest final check.** On stop it re-measures your original baseline. If that's now as fast as the "optimised" tune, it reports *"net improvement within driver variation — changes not confirmed"* instead of claiming a tune win.
+
+## Tuning time budget
+
+There's a **Max tuning time** setting (default **20 minutes**; set **0** for unlimited), in both the setup form and **Settings → Max tuning time (minutes)** in the main window — they share one persisted value, and the main-window control applies live even mid-run. It's *real wall-clock* time that starts on your **first Rivals lap** and runs continuously — including loading screens, menu time, and entering tune changes — and is never paused.
+
+It's a **ceiling, not a target**: if the tool converges first (every lever improved-or-locked, nothing left to try) it stops and saves immediately, with time to spare — it never idles or re-tests just to fill the clock. On expiry it finishes the test already in progress (never a half-tested change), runs the honest final check, then stops. The overlay shows the time remaining; the saved status reads `converged` or `stopped: time budget` accordingly.
+
+## Reading the overlay
+
+Overlay states come in two unmistakable colours. **Amber "CHANGE THESE NOW"** means edit the tune menu — it lists the exact fields as *from → to* (only what changed, including any revert) and ends with "press F8 when applied". **Green** means just drive, hands off the menu — `WARM-UP`, `OUT-LAP` (neither counted), `MEASURING — lap x/y` (a counted lap), `RE-ANCHOR`, or `FINAL CHECK`.
 
 ## Car names
 
