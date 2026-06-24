@@ -37,6 +37,8 @@ def grab(name: str, region: Optional[Tuple[int, int, int, int]] = None,
 
     if _grab_mss(path, region):
         return path
+    if _grab_pillow(path, region):
+        return path
     if _grab_pyautogui(path, region):
         return path
     raise RuntimeError(
@@ -44,6 +46,27 @@ def grab(name: str, region: Optional[Tuple[int, int, int, int]] = None,
         "  pip install mss        (recommended)\n"
         "  pip install pyautogui  (fallback)"
     )
+
+
+def _grab_pillow(path: str, region) -> bool:
+    """Pillow's ImageGrab - ALWAYS available in the frozen build (Pillow is a hard
+    dependency for OCR), so the screenshot backend can't go missing the way an
+    un-bundled mss/pyautogui can. Windows/macOS only (which is all we ship)."""
+    try:
+        from PIL import ImageGrab  # type: ignore
+    except Exception:
+        return False
+    try:
+        if region:
+            l, t, w, h = region
+            bbox = (l, t, l + w, t + h)              # PIL wants (l,t,r,b)
+            img = ImageGrab.grab(bbox=bbox)
+        else:
+            img = ImageGrab.grab()
+        img.save(path)
+        return True
+    except Exception:
+        return False
 
 
 def _grab_mss(path: str, region) -> bool:
@@ -74,6 +97,14 @@ def _grab_pyautogui(path: str, region) -> bool:
 
 
 def backend_available() -> bool:
+    # Pillow's ImageGrab is the always-bundled backend; mss/pyautogui are optional
+    # fast paths. Probe ImageGrab.grab too, not just the import (headless => no grab).
+    try:
+        from PIL import ImageGrab
+        ImageGrab.grab(bbox=(0, 0, 1, 1))
+        return True
+    except Exception:
+        pass
     for mod in ("mss", "pyautogui"):
         try:
             __import__(mod)
@@ -81,6 +112,26 @@ def backend_available() -> bool:
         except Exception:
             continue
     return False
+
+
+def backend_name() -> str:
+    """Which screenshot backend is active (for the startup diagnostic)."""
+    try:
+        import mss  # noqa: F401
+        return "mss"
+    except Exception:
+        pass
+    try:
+        from PIL import ImageGrab
+        ImageGrab.grab(bbox=(0, 0, 1, 1))
+        return "Pillow ImageGrab"
+    except Exception:
+        pass
+    try:
+        import pyautogui  # noqa: F401
+        return "pyautogui"
+    except Exception:
+        return "none"
 
 
 def screen_size() -> Optional[Tuple[int, int]]:

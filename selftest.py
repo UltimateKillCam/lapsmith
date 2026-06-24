@@ -675,11 +675,9 @@ def test_auto_lap():
     cend.listener.push(_lap_packets(1, 1.0, 0.0)); cend.tick()
     cend.listener.push(_lap_packets(1, 3.0, 0.0)); cend.tick()      # CurrentLap rose -> engage
     check("tick path: AUTO engaged from detecting", cend.mode == C.MODE_AUTO)
-    cend.listener.push(_lap_packets(2, 1.0, 53.0)); cend.tick()     # warm-up lap 1 -> skipped
-    check("tick path: warm-up lap 1 skipped, no reference yet", cend.best_segment is None)
-    cend.listener.push(_lap_packets(3, 1.0, 54.0)); cend.tick()     # warm-up lap 2 -> skipped (WARMUP_LAPS=2)
-    check("tick path: warm-up lap 2 skipped, no reference yet", cend.best_segment is None)
-    cend.listener.push(_lap_packets(4, 1.0, 52.0)); cend.tick()     # full lap -> baseline + change
+    cend.listener.push(_lap_packets(2, 1.0, 53.0)); cend.tick()     # warm-up lap -> skipped (WARMUP_LAPS=1)
+    check("tick path: warm-up lap skipped, no reference yet", cend.best_segment is None)
+    cend.listener.push(_lap_packets(3, 1.0, 52.0)); cend.tick()     # full lap -> baseline + change
     check("tick path: baseline reference from a full lap (52.0)",
           cend.best_segment is not None and abs(cend.best_segment - 52.0) < 1e-6)
     check("tick path: FIRST CHANGE emitted (overlay would show NEXT)",
@@ -1250,17 +1248,17 @@ def test_console_mode():
     from lapsmith import identity
     ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
 
-    # --- 2) LAN bind: PC=loopback, console=all interfaces (PC path unchanged) ----
+    # --- 2) bind ALL interfaces (0.0.0.0) in PC + console: captures loopback AND LAN
+    #        delivery (the installed-build "no telemetry" fix). Same robust bind both.
     c = C.Controller(); c.identity = ident
-    check("PC mode binds loopback (127.0.0.1)", c._bind_host() == "127.0.0.1")
+    check("PC mode binds all interfaces (0.0.0.0) - captures loopback + adapter delivery",
+          c._bind_host() == "0.0.0.0")
     c.set_console_mode(True)
-    check("console mode binds all interfaces (0.0.0.0) for LAN telemetry",
+    check("console mode also binds all interfaces (0.0.0.0)",
           c.console_mode and c._bind_host() == "0.0.0.0")
-    # the listener actually carries the host through to the socket bind target
     c.listener = TelemetryListener(port=5651, host=c._bind_host())   # constructed, not started
-    c.set_console_mode(False)
-    check("toggling back rebinds the listener to loopback (live, no restart)",
-          c.listener.host == "127.0.0.1")
+    check("the listener carries the all-interfaces host to the socket bind target",
+          c.listener.host == "0.0.0.0")
     check("LAN IP is surfaced for the console's Data Out target",
           isinstance(c.lan_ip(), str) and c.lan_ip().count(".") == 3)
 
@@ -1642,10 +1640,10 @@ def test_logging_v0114():
     c._temp_warned = False
     c._warn_temp_blind_once()
     check("#4 the warning fires once and is recorded in the decision log",
-          c._temp_warned and "NO TEMP READER" in open(logp, encoding="utf-8").read())
+          c._temp_warned and "HEAT SCREEN NOT READ" in open(logp, encoding="utf-8").read())
     st = c.status()
     check("#4 the no-temp notice is surfaced in status (-> persistent overlay banner)",
-          st["temp_blind"] and "blind" in (st["temp_notice"] or "").lower())
+          st["temp_blind"] and "heat" in (st["temp_notice"] or "").lower())
     # a real reading clears it; dirt + console never warn
     c.tyre_reading = {"FL": {"inner": 90, "outer": 80}}; c.last_reader = "rapidocr"
     check("#4 a real 3-zone reading clears the blind state", c.temp_blind() is False)
@@ -1727,6 +1725,136 @@ def test_richer_channels_v0115():
     sbr = rules._rule_spring_balance(us, sat, "road", None, True, CarLimits())
     check("spring-balance 'why' cites front-vs-rear suspension travel when live",
           sbr is not None and "front compresses more than rear" in sbr.reason)
+
+
+def test_recalibration_v0116():
+    print("\n== recalibrate triggers (slip-angle units, richer channels), capture, gate-revert ==")
+    from lapsmith.knowledge import rules
+    from lapsmith.state.tune_state import Tune, CarLimits
+    from lapsmith.telemetry.session import TestStats
+    from lapsmith.vision import capture
+    from lapsmith.gui import controller as C
+    from lapsmith.knowledge.rules import Recommendation
+    from lapsmith import identity
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+
+    # --- #2: a screenshot backend is ALWAYS available (Pillow ImageGrab is bundled) -
+    check("#2 a screenshot backend is available (Pillow ImageGrab, frozen-proof)",
+          capture.backend_available())
+    check("#2 backend_name reports the active backend (not 'none')",
+          capture.backend_name() != "none")
+
+    # --- #1 ARB: fires on NORMALIZED-scale slip-angle imbalance (the root cause) -----
+    us = TestStats(slip_angle_front=0.72, slip_angle_rear=0.45, n_corner_frames=20)
+    check("#1 ARB fires on a normalized slip-angle imbalance (0.27) - was unreachable at 1.5",
+          (rules._rule_arb(us, Tune(), "road", None, True, CarLimits()) or 0) and
+          rules._rule_arb(us, Tune(), "road", None, True, CarLimits()).group == "arb")
+    neu = TestStats(slip_angle_front=0.50, slip_angle_rear=0.45, n_corner_frames=20)
+    check("#1 ARB stays silent when near-balanced (delta 0.05 < 0.18; no over-firing)",
+          rules._rule_arb(neu, Tune(), "road", None, True, CarLimits()) is None)
+    roll = TestStats(slip_angle_front=0.50, slip_angle_rear=0.46, n_corner_frames=20,
+                     chan_suspension=True, roll_asym_front=0.22, roll_asym_rear=0.05)
+    rr = rules._rule_arb(roll, Tune(), "road", None, True, CarLimits())
+    check("#1 ARB fires from BODY ROLL when slip-angle is inconclusive (richer channel)",
+          rr is not None and "rolls more" in rr.reason)
+
+    # --- #1 pressure: fires on a smaller L/R temp delta now (TEMP_BAL_C 6 -> 4) ------
+    pt = TestStats(temp_fl=95.0, temp_fr=90.0, temp_rl=85.0, temp_rr=85.0, n_corner_frames=20)
+    pr = rules._rule_pressure(pt, Tune(), "road", None, True, CarLimits())
+    check("#1 pressure fires on a 5C L/R delta (was gated at 6C)",
+          pr is not None and pr.group == "pressure")
+    pt2 = TestStats(temp_fl=93.0, temp_fr=90.0, temp_rl=90.0, temp_rr=90.0, n_corner_frames=20)
+    check("#1 pressure stays silent below the delta (3C < 4C)",
+          rules._rule_pressure(pt2, Tune(), "road", None, True, CarLimits()) is None)
+
+    # --- #1 damping: fires on a harsh/busy ride (vertical-g); degrades when absent ---
+    dh = TestStats(vert_g_rms=0.6, chan_vertical_accel=True, susp_min_front=0.3,
+                   susp_min_rear=0.5, susp_max_front=0.8, susp_max_rear=0.8, n_corner_frames=20)
+    dr = rules._rule_damping(dh, Tune(), "road", None, True, CarLimits())
+    check("#1 damping fires on a harsh/busy ride (vertical-g RMS, richer channel)",
+          dr is not None and dr.group == "damping_bump" and "vertical-g" in dr.reason.lower())
+    dn = TestStats(vert_g_rms=0.6, chan_vertical_accel=False, susp_min_front=0.3,
+                   susp_min_rear=0.5, n_corner_frames=20)
+    check("#1 damping degrades gracefully without the vertical channel (no fire on garbage)",
+          rules._rule_damping(dn, Tune(), "road", None, True, CarLimits()) is None)
+
+    # --- #1 aero: relaxed grip-limited threshold (needs the aero range entered) ------
+    lim = CarLimits(aero_rear_min=50.0, aero_rear_max=300.0)
+    t = Tune(); t.aero_rear = 100.0
+    ga = TestStats(max_lateral_g=1.05, n_corner_frames=20)
+    ar = rules._rule_aero(ga, t, "road", None, True, lim)
+    check("#1 aero engages on a grip-limited road car (peak 1.05 g < 1.10)",
+          ar is not None and ar.group == "aero")
+
+    # --- #3: a gate-driven REVERT syncs on-car so no phantom no-op next checklist ----
+    c = C.Controller(); c.identity = ident; c.apply_setup("road", CarLimits()); c.mode = C.MODE_AUTO
+    c.best_segment = 50.0
+    c.state.current.set("ride_height_f", 10.7); c._on_car["ride_height_f"] = 10.7
+    rec = c.state.apply_change("ride_height", {"ride_height_f": 12.2}, "t", "")  # user F8 applied 12.2
+    c._applied_records = [rec]; c._on_car["ride_height_f"] = 12.2
+    c._revert_batch()                                                            # the gate reverts it
+    check("#3 a gate-revert syncs on-car to the reverted value (10.7, not the stale 12.2)",
+          abs(c._on_car["ride_height_f"] - 10.7) < 1e-6
+          and abs(c.state.current.get("ride_height_f") - 10.7) < 1e-6)
+    c._applied_records = []; c.batch = [Recommendation("arb", {"arb_r": 55.0}, "t", "")]
+    cl = c.menu_checklist()
+    check("#3 the next checklist has NO already-satisfied (from==to) ride entry (no phantom)",
+          not any(it["field"] == "ride_height_f" for it in cl)
+          and all(it["from"] != it["to"] for it in cl))
+
+    # --- #4: warm-up is now 1 lap ---------------------------------------------------
+    check("#4 WARMUP_LAPS is 1 (one cold lap from the start, then measuring)",
+          rules.WARMUP_LAPS == 1)
+
+
+def test_install_telemetry_v0117():
+    print("\n== install bug: 0.0.0.0 bind captures loopback + 'no packets -> firewall' diag ==")
+    import socket, time as _t
+    from lapsmith.gui import controller as C
+    from lapsmith.telemetry.listener import TelemetryListener
+
+    # --- the WHOLE fix: a 0.0.0.0 bind MUST receive packets sent to 127.0.0.1 (loopback)
+    port = 5691
+    lis = TelemetryListener(port=port, host="0.0.0.0")
+    lis.start()
+    try:
+        pkt = simulator._build_packet(simulator.frame(0.5, "understeer"))
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for _ in range(8):
+            s.sendto(pkt, ("127.0.0.1", port)); _t.sleep(0.02)
+        s.close()
+        _t.sleep(0.4)
+        check("0.0.0.0 bind RECEIVES loopback packets sent to 127.0.0.1 (the install-bug fix)",
+              lis.packet_count > 0)
+    finally:
+        lis.stop()
+
+    # --- 'bound but no packets' -> specific firewall/Data-Out diagnostic ------------
+    c = C.Controller()
+    class _Fake:
+        packet_count = 0
+        last_packet = None
+        last_packet_time = 0.0
+        def snapshot(self): return None
+        def is_receiving(self, within_s=1.0): return False
+    c.listener = _Fake()
+    check("diagnostic silent before the listener starts", c.telemetry_diagnostic() is None)
+    c._listen_start_t = _t.perf_counter()
+    check("diagnostic silent in the grace window (no false alarm)", c.telemetry_diagnostic() is None)
+    c._listen_start_t = _t.perf_counter() - (C.TELEMETRY_NODATA_WARN_S + 1)   # elapsed, 0 packets
+    msg = c.telemetry_diagnostic()
+    check("after N s with 0 packets -> SPECIFIC firewall/Data-Out message (not 'no car')",
+          msg is not None and "firewall" in msg.lower() and "data out" in msg.lower())
+    c.listener.packet_count = 5
+    check("diagnostic clears the moment telemetry arrives", c.telemetry_diagnostic() is None)
+    # and it replaces the generic 'waiting for telemetry' guidance at WAIT_TELEMETRY
+    c.listener.packet_count = 0
+    c._listen_start_t = _t.perf_counter() - (C.TELEMETRY_NODATA_WARN_S + 1)
+    c.phase = C.WAIT_TELEMETRY
+    check("WAIT_TELEMETRY guidance shows the firewall diagnostic, not a generic 'waiting'",
+          "firewall" in (c.guided_step().get("action", "") or "").lower())
+    check("status() surfaces the telemetry diagnostic for the overlay",
+          "firewall" in (c.status().get("telemetry_diagnostic", "") or "").lower())
 
 
 def test_batch_changes():
@@ -2624,6 +2752,8 @@ if __name__ == "__main__":
     test_critical_fixes_v0113()
     test_logging_v0114()
     test_richer_channels_v0115()
+    test_recalibration_v0116()
+    test_install_telemetry_v0117()
     test_batch_changes()
     test_multi_lap_fitness()
     test_lateral_capture_axis()

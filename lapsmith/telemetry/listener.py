@@ -1,6 +1,7 @@
 """One-way UDP listener for the FH6 Data Out feed.
 
-Read-only: opens a single UDP socket bound to 127.0.0.1:<port> and decodes
+Read-only: opens a single UDP socket bound to <host>:<port> (the app binds all
+interfaces, 0.0.0.0, so it captures both loopback and LAN-delivered packets) and decodes
 frames into Packet objects on a background thread, keeping a ring buffer of the
 most recent frames. No packets are ever sent. This touches nothing the game
 protects - it is exactly what any telemetry dashboard does.

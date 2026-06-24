@@ -62,6 +62,10 @@ DONE = "done"
 MODE_AUTO = "auto"       # Rivals/circuit: lap fields live -> auto-lap
 MODE_MANUAL = "manual"   # free-roam: F9/F10 segment markers
 
+# Seconds the listener can be bound with ZERO packets before we surface the specific
+# "no data - likely firewall / Data Out off" diagnostic (instead of "no car detected").
+TELEMETRY_NODATA_WARN_S = 10.0
+
 
 @dataclass
 class Controller:
@@ -183,6 +187,8 @@ class Controller:
     persist: bool = False              # app sets True; gates disk writes (off in tests)
     _temp_warned: bool = False         # logged the no-temp-reader warning once
     _channels_logged: bool = False     # logged which telemetry channels were live
+    _listen_start_t: float = 0.0       # perf_counter when the UDP listener started
+    _nodata_logged: bool = False       # logged the "bound but no packets" diagnostic once
     # change aggressiveness -> step multiplier (fine 0.5 / normal 1.0 / coarse 2.0).
     aggressiveness: str = "normal"
     stale: int = 0
@@ -214,14 +220,42 @@ class Controller:
 
     # ---- lifecycle -------------------------------------------------------
     def _bind_host(self) -> str:
-        # Console mode: the console streams from another LAN device, so listen on all
-        # interfaces. PC mode stays on loopback (safer; no LAN exposure).
-        return "0.0.0.0" if self.console_mode else "127.0.0.1"
+        # Bind ALL interfaces (0.0.0.0) - this captures BOTH loopback (PC Forza ->
+        # 127.0.0.1) AND traffic that arrives via a network adapter (a console on the
+        # LAN, or a PC build where Forza routes Data Out through the adapter rather than
+        # pure loopback). A 127.0.0.1-only bind misses the latter, which is the likely
+        # cause of "installed build receives no telemetry" - so PC and console use the
+        # same robust bind. (The installer adds a firewall allow-rule for the port.)
+        return "0.0.0.0"
 
     def start(self):
         if self.listener is None:
             self.listener = TelemetryListener(port=self.port, host=self._bind_host())
         self.listener.start()
+        self._listen_start_t = time.perf_counter()    # for the "no packets" diagnostic
+
+    def telemetry_diagnostic(self) -> Optional[str]:
+        """If the UDP socket is bound but has received ZERO packets for a while, the
+        most common cause is Windows Firewall silently dropping inbound UDP (a fresh
+        install at a new path has no allow-rule), or Forza's Data Out being off / not
+        pointed here. Return a SPECIFIC message for that case (not 'no car detected'),
+        else None once data is flowing."""
+        if self.listener is None or self._listen_start_t == 0.0:
+            return None
+        if getattr(self.listener, "packet_count", 0) > 0:
+            return None                                # data has arrived at least once
+        if time.perf_counter() - self._listen_start_t < TELEMETRY_NODATA_WARN_S:
+            return None
+        if not self._nodata_logged:
+            self._nodata_logged = True
+            _laplog.warning("NO TELEMETRY: bound on %s:%d but 0 packets in %.0fs - likely "
+                            "Windows Firewall blocking LapSmith, or Forza Data Out off / not "
+                            "pointed at 127.0.0.1:%d.", self._bind_host(), self.port,
+                            TELEMETRY_NODATA_WARN_S, self.port)
+        return (f"Listening on {self.port} but no telemetry received. This is usually "
+                "Windows Firewall blocking LapSmith - allow it through (or reinstall, the "
+                "installer adds the rule) - or check Forza's Data Out is ON and pointed at "
+                f"127.0.0.1:{self.port}.")
 
     def set_console_mode(self, on: bool):
         """Toggle console mode. Rebinds the UDP listener (loopback <-> all interfaces)
@@ -760,10 +794,11 @@ class Controller:
             return self.drivetrain_override
         return self.identity.drivetrain if self.identity else "AWD"
 
-    TEMP_BLIND_NOTICE = ("No tyre-temp reading on a tarmac run - camber/toe are being "
-                         "tuned BLIND (by lap time only) and will be unreliable. Bring up "
-                         "the in-game Heat/tyre-temp page on a hard cornering lap so it "
-                         "can read the 3-zone temps.")
+    TEMP_BLIND_NOTICE = ("Can't read the in-game Heat / tyre-temp SCREEN (the 3-zone "
+                         "inner/mid/outer temps) - telemetry is fine, but camber/toe are "
+                         "limited to lap-time tuning until it reads. Show the Heat page on "
+                         "a hard cornering lap; if it still won't read, the screenshot "
+                         "backend may be unavailable (see app.log).")
 
     def temp_blind(self) -> bool:
         """True when tyre temps MATTER (tarmac) but no temp source is producing a
@@ -783,9 +818,9 @@ class Controller:
         if self._temp_warned or not self.temp_blind() or self.best_segment is None:
             return
         self._temp_warned = True
-        _laplog.warning("NO TEMP READER: tarmac run with no tyre-temp reading "
-                        "(reader=%s) - camber/toe are being tuned BLIND by lap time. %s",
-                        self.last_reader, self.TEMP_BLIND_NOTICE)
+        _laplog.warning("HEAT SCREEN NOT READ: tarmac run, 3-zone tyre-temp screen "
+                        "unavailable (reader=%s) - UDP telemetry is live; camber/toe are "
+                        "limited to lap-time tuning. %s", self.last_reader, self.TEMP_BLIND_NOTICE)
         self.log("[temps] " + self.TEMP_BLIND_NOTICE)
 
     CONSOLE_NOTICE = ("Console mode: only ONE tyre temperature per corner is available "
@@ -1058,6 +1093,7 @@ class Controller:
                 self._lever_locked.add(key)
                 roll = self._last_improving.get(fld, self.state.current.get(fld))
                 self.state.current.set(fld, roll)
+                self._on_car[fld] = roll     # rolled-back value is what the car should be on
                 _laplog.info("ANTI-FIXATION: lever '%s' hit the no-improve cap (%d) - "
                              "LOCKED and ROLLED BACK %s to its last improving value %.2f.",
                              key, rules.LEVER_NOIMPROVE_CAP, fld, roll)
@@ -1105,6 +1141,9 @@ class Controller:
         for r in reversed(self._applied_records):
             for k, v in r.previous.items():
                 self.state.current.set(k, v)
+                self._on_car[k] = v          # gate-revert: the car returns to the previous
+                                             # value, so on-car tracks it (no phantom revert
+                                             # instruction next iteration)
             r.verdict = "reverted"
 
     # --- telemetry-primary gate (H) + A/B/A (B) --------------------------------
@@ -1933,6 +1972,9 @@ class Controller:
         auto = mode == MODE_AUTO
         # 1. SELECT CAR
         if ph == WAIT_TELEMETRY:
+            diag = self.telemetry_diagnostic()       # bound but no packets -> firewall hint
+            if diag:
+                return self._g(1, "Select car", diag)
             return self._g(1, "Select car",
                            f"Start driving in FH6 (Data Out on, port {port}) - "
                            "waiting for telemetry.")
@@ -2096,6 +2138,7 @@ class Controller:
             "test_best": min(self._test_laps) if self._test_laps else None,
             "port": self.port,
             "packet_age_s": self.packet_age_s(),
+            "telemetry_diagnostic": self.telemetry_diagnostic(),
             "error": self.error,
             "mode": self.mode,
             "mode_label": mode_label,

@@ -255,6 +255,14 @@ def main(argv=None) -> int:
     prefs.set_store_path(os.path.join(data_dir, "prefs.json"))
     configure_raw_telemetry_log(bool(prefs.get("verbose_telemetry", False)))  # default OFF
     capture.CAPTURE_DIR = os.path.join(data_dir, "captures")   # Heat frames under the data dir
+    # STARTUP DIAGNOSTIC: which screenshot backend is active (Pillow ImageGrab ships
+    # with the build, so this should never be 'none'; if it is, Heat-screen OCR is off).
+    _backend = capture.backend_name()
+    if _backend == "none":
+        log.warning("SCREENSHOT BACKEND: none available - in-game Heat-screen OCR is OFF; "
+                    "camber/toe will be lap-time only. (Pillow ImageGrab should be bundled.)")
+    else:
+        log.info("screenshot backend: %s", _backend)
     log.info("loaded %d saved car name(s); tunes -> %s", n, store.SESSIONS_DIR)
 
     ctrl = C.Controller(port=args.port,
@@ -468,10 +476,23 @@ def main(argv=None) -> int:
         try:
             ctrl.poll_identity()                       # need a live, detected car
             if ctrl.identity is None:
-                QtWidgets.QMessageBox.information(
-                    window, "Start tuning",
-                    "No car detected yet. In FH6: enable Data Out, set borderless "
-                    "windowed, and drive briefly - then press START TUNING again.")
+                # Distinguish "no telemetry at all" (firewall / Data Out off - the #1
+                # installed-build cause) from "telemetry arriving but no live car yet".
+                pkts = getattr(ctrl.listener, "packet_count", 0) if ctrl.listener else 0
+                if pkts == 0:
+                    msg = (f"No telemetry received on port {ctrl.port}.\n\n"
+                           "This is usually Windows Firewall blocking LapSmith - allow it "
+                           "through (or re-run the installer, which now adds the rule) - OR "
+                           "Forza's Data Out is OFF or not pointed at "
+                           f"127.0.0.1:{ctrl.port}.\n\n"
+                           "Enable Data Out (borderless windowed), then press START TUNING "
+                           "again. See app.log for details.")
+                    log.warning("START: identity none AND 0 packets on port %s - likely "
+                                "firewall / Data Out off.", ctrl.port)
+                else:
+                    msg = ("Telemetry is arriving but no live car yet. Drive briefly in FH6 "
+                           "(out of a menu), then press START TUNING again.")
+                QtWidgets.QMessageBox.information(window, "Start tuning", msg)
                 return
             ctrl.reset_session()                       # clean slate for a new car/run
             ctrl.confirm_car()                         # prompts for a name if unknown
@@ -567,6 +588,7 @@ def main(argv=None) -> int:
     def pump():
         # never let an exception escape the timer slot (that can kill the loop)
         try:
+            ctrl.telemetry_diagnostic()      # logs the "bound but no packets" hint once
             if ctrl.phase == C.WAIT_TELEMETRY:
                 ctrl.poll_identity()
             else:

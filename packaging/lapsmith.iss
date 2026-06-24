@@ -78,4 +78,21 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags
     Flags: uninsdeletevalue; Tasks: runadmin
 
 [Run]
+; Allow LapSmith to RECEIVE Forza's Data Out UDP telemetry through Windows Firewall.
+; A fresh install at a new path is a different program with no rule, so inbound UDP can
+; be silently dropped (the #1 "installed build sees no telemetry" cause). The installer
+; runs elevated, so netsh can add the rule. (Delete any stale same-name rule first so a
+; re-install / upgrade doesn't stack duplicates.)
+Filename: "{sys}\netsh.exe"; \
+    Parameters: "advfirewall firewall delete rule name=""LapSmith telemetry (UDP in)"""; \
+    Flags: runhidden; StatusMsg: "Updating firewall rule..."
+Filename: "{sys}\netsh.exe"; \
+    Parameters: "advfirewall firewall add rule name=""LapSmith telemetry (UDP in)"" dir=in action=allow program=""{app}\{#MyAppExeName}"" protocol=UDP profile=any enable=yes"; \
+    Flags: runhidden; StatusMsg: "Adding firewall rule for telemetry..."
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+; Remove the firewall rule on uninstall so we leave no trace.
+Filename: "{sys}\netsh.exe"; \
+    Parameters: "advfirewall firewall delete rule name=""LapSmith telemetry (UDP in)"""; \
+    Flags: runhidden

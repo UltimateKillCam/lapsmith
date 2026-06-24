@@ -20,7 +20,9 @@ _rlog = logging.getLogger("lapsmith.rules")     # per-iteration eligible-vs-fire
 
 # === tunable constants ======================================================
 # A. pressure
-TEMP_BAL_C = 6.0          # axle-mate temp delta that triggers a pressure drop
+TEMP_BAL_C = 4.0          # axle-mate temp delta (C) that triggers a pressure drop. Was
+                          # 6.0 - too strict; a normal road run's L/R delta rarely hit it
+                          # so the pressure lever almost never engaged.
 PRESSURE_STEP = 0.5       # psi
 PRESSURE_MIN, PRESSURE_MAX = 25.0, 34.0     # road band
 GREASY_COMBINED_SLIP = 1.0   # combined slip above this on a hot axle = greasy
@@ -31,6 +33,10 @@ BOTTOM_THRESH = 0.05      # normalized susp travel <= this = bottoming (road/tar
 # LOWER threshold there means we only chase genuinely severe bottoming, not forever.
 BOTTOM_THRESH_DIRT = 0.02
 STIFF_THRESH = 0.55       # never drops below this = under-using travel
+# vertical-accel RMS above this = a busy/harsh ride (the car is being bounced) -> the
+# bump damping is too stiff. A richer trigger so damping engages on real oscillation,
+# not only the rare "never compresses" case.
+RIDE_HARSH_VERT_G = 0.45
 RIDE_STEP = 1.5           # cm  (was 1.0 - too timid; convergence was glacial)
 BUMP_STEP = 2.0           # was 1.0
 BUMP_SOFTEN_STEP = 1.0    # was 0.5
@@ -43,9 +49,16 @@ STEP_MULT = {"fine": 0.5, "normal": 1.0, "coarse": 2.0}
 # C. camber (from tyre-temp screenshot inner/mid/outer)
 CAMBER_C = 5.0            # inner-outer delta (deg C) tolerance band
 CAMBER_STEP = 0.2         # deg
-# D. balance / ARBs
-US_DEG = 1.5             # front slip-angle exceeds rear by this = understeer
-OS_DEG = 1.5
+# D. balance / ARBs.
+# ROOT CAUSE of "ARB never fires": Forza's TireSlipAngle is NORMALIZED (0 = full grip,
+# ~1.0 = grip limit), NOT degrees. The old 1.5 threshold (a degree value) is larger than
+# the whole signal, so the front-vs-rear imbalance never crossed it on a real car. A
+# meaningful normalized imbalance is ~0.15-0.25.
+US_DEG = 0.18            # normalized front-minus-rear slip-angle imbalance = understeer
+OS_DEG = 0.18
+# Body-ROLL imbalance (from per-corner suspension) as a richer ALTERNATIVE balance signal
+# when the slip-angle reading is weak: one axle leaning/compressing more than its mate.
+ROLL_IMBALANCE = 0.06
 ARB_STIFFEN_STEP = 5.0
 ARB_SOFTEN_STEP = 3.0
 ARB_MAX = 65.0
@@ -83,7 +96,7 @@ LEVER_NOIMPROVE_CAP = 2
 
 # --- drift-robust methodology (a single, driver-confounded lap is too weak) -----
 LAPS_PER_TEST = 2              # clean green laps aggregated into ONE measurement
-WARMUP_LAPS = 2               # cold/learning laps before the first baseline anchor
+WARMUP_LAPS = 1               # one cold lap from the standstill start, then measuring begins
 BASELINE_REANCHOR_EVERY = 3   # re-measure the accepted tune every N iterations
 # wall-clock session budget (real minutes from the first Rivals lap; 0 = unlimited)
 DEFAULT_TIME_BUDGET_MIN = 20
@@ -550,35 +563,52 @@ def _rule_camber_search(stats, tune, disc, tyre_reading, road_band, limits,
 
 
 # --- D. balance / ARBs ------------------------------------------------------
-def _rule_arb(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[Recommendation]:
+def _balance_verdict(stats):
+    """understeer / oversteer / None for the corner window. PRIMARY: normalized
+    front-vs-rear slip-angle imbalance. RICHER FALLBACK: when the slip-angle signal is
+    weak, body ROLL from per-corner suspension - the axle that rolls (compresses L-vs-R)
+    more is the one losing grip. Returns (verdict, evidence_text)."""
     if stats.n_corner_frames < 10:
-        return None  # not enough cornering data to judge balance
+        return None, ""
     fa, ra = stats.slip_angle_front, stats.slip_angle_rear
-    if fa - ra > US_DEG:   # understeer
+    if fa - ra > US_DEG:
+        return "understeer", f"front slip {fa:.2f} > rear {ra:.2f} (imbalance {fa - ra:.2f})"
+    if ra - fa > OS_DEG:
+        return "oversteer", f"rear slip {ra:.2f} > front {fa:.2f} (imbalance {ra - fa:.2f})"
+    if getattr(stats, "chan_suspension", False):
+        rf, rr = stats.roll_asym_front, stats.roll_asym_rear
+        if rf - rr > ROLL_IMBALANCE:
+            return "understeer", f"front rolls more than rear ({rf:.2f} vs {rr:.2f})"
+        if rr - rf > ROLL_IMBALANCE:
+            return "oversteer", f"rear rolls more than front ({rr:.2f} vs {rf:.2f})"
+    return None, ""
+
+
+def _rule_arb(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[Recommendation]:
+    verdict, why = _balance_verdict(stats)
+    if verdict == "understeer":
         if tune.arb_r < ARB_REAR_SOFT_FLOOR:
             new = _clamp(tune.arb_r + ARB_STIFFEN_STEP, ARB_MIN, ARB_MAX)
             return Recommendation("arb", {"arb_r": _round(new)},
-                f"Understeer: front slip angle {fa:.1f} deg exceeds rear {ra:.1f} "
-                f"by > {US_DEG}.",
+                f"Understeer: {why}.",
                 "Front tucks into the corner; less push, car rotates more.",
                 f"Rear ARB {tune.arb_r:.0f} -> {new:.0f}")
         new = _clamp(tune.arb_f - ARB_SOFTEN_STEP, ARB_MIN, ARB_MAX)
         if new != tune.arb_f:
             return Recommendation("arb", {"arb_f": _round(new)},
-                f"Understeer, rear ARB already stiff ({tune.arb_r:.0f}).",
+                f"Understeer ({why}); rear ARB already stiff ({tune.arb_r:.0f}).",
                 "Softer front adds front grip; less mid-corner push.",
                 f"Front ARB {tune.arb_f:.0f} -> {new:.0f}")
-    if ra - fa > OS_DEG:   # oversteer
+    if verdict == "oversteer":
         if tune.arb_r > ARB_MIN:
             new = _clamp(tune.arb_r - ARB_SOFTEN_STEP, ARB_MIN, ARB_MAX)
             return Recommendation("arb", {"arb_r": _round(new)},
-                f"Oversteer: rear slip angle {ra:.1f} deg exceeds front {fa:.1f} "
-                f"by > {OS_DEG}.",
+                f"Oversteer: {why}.",
                 "Rear plants; less snap, more confident throttle mid-corner.",
                 f"Rear ARB {tune.arb_r:.0f} -> {new:.0f}")
         new = _clamp(tune.arb_f + ARB_STIFFEN_STEP, ARB_MIN, ARB_MAX)
         return Recommendation("arb", {"arb_f": _round(new)},
-            f"Oversteer, rear ARB already soft ({tune.arb_r:.0f}).",
+            f"Oversteer ({why}); rear ARB already soft ({tune.arb_r:.0f}).",
             "Stiffer front trims rotation back toward neutral.",
             f"Front ARB {tune.arb_f:.0f} -> {new:.0f}")
     return None
@@ -586,6 +616,21 @@ def _rule_arb(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[Re
 
 # --- B'. damping softening (harsh/under-used travel) ------------------------
 def _rule_damping(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[Recommendation]:
+    # RICHER trigger: a busy/harsh ride (high vertical-g RMS) means the car is being
+    # bounced - the bump damping is too stiff. Soften the axle that's working its travel
+    # the least (so we don't soften an axle that's already moving plenty).
+    if getattr(stats, "chan_vertical_accel", False) and stats.vert_g_rms > RIDE_HARSH_VERT_G:
+        front_busier = stats.susp_min_front > stats.susp_min_rear   # front uses less travel
+        bp = "bump_f" if front_busier else "bump_r"
+        cur = tune.bump_f if front_busier else tune.bump_r
+        new = _round(cur - BUMP_SOFTEN_STEP)
+        if new >= 0 and new < cur:
+            axle = "Front" if front_busier else "Rear"
+            return Recommendation("damping_bump", {bp: new},
+                f"Harsh/busy ride: vertical-g RMS {stats.vert_g_rms:.2f} (> {RIDE_HARSH_VERT_G}) "
+                f"- {axle.lower()} bump too stiff, the car is being bounced.",
+                f"{axle} tyre stays in contact over bumps; smoother, more grip.",
+                f"{axle} bump {cur:.1f} -> {new:.1f}")
     # If neither axle ever uses much travel, the car is likely skittish/harsh.
     if stats.susp_min_front >= STIFF_THRESH and stats.susp_max_front <= 0.9:
         new = _round(tune.bump_f - BUMP_SOFTEN_STEP)
@@ -794,7 +839,7 @@ def _rule_aero(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[R
             "Grip surplus (peak >1.1 g) but not reaching top speed - drag-limited.",
             "Higher trap speed for a small loss of cornering downforce.",
             f"Rear aero {tune.aero_rear:.0f} -> {new:.0f}")
-    if disc in ("road", "touge") and stats.max_lateral_g < 1.0:
+    if disc in ("road", "touge") and stats.max_lateral_g < 1.10:
         new = _round(tune.aero_rear + step, 1)
         return Recommendation("aero", {"aero_rear": new},
             f"Cornering grip-limited (peak only {stats.max_lateral_g:.2f} g) on a "
