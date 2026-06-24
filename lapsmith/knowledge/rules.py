@@ -9,11 +9,14 @@ after a few real sessions.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List
 
 from ..telemetry.session import TestStats
 from ..state.tune_state import Tune, CarLimits, STOCK
+
+_rlog = logging.getLogger("lapsmith.rules")     # per-iteration eligible-vs-fired trace
 
 # === tunable constants ======================================================
 # A. pressure
@@ -140,6 +143,18 @@ def _filter_locked_levers(rec: "Recommendation", tune: Tune,
     return rec
 
 
+def _filter_rejected(rec: "Recommendation", rejected_fields) -> Optional["Recommendation"]:
+    """Drop any field the user REJECTED for the session (never propose it again); None
+    if all fields are rejected, so it doesn't count as 'a rule fired' (loop converges)."""
+    if not rejected_fields:
+        return rec
+    kept = {f: v for f, v in rec.fields.items() if f not in rejected_fields}
+    if not kept:
+        return None
+    rec.fields = kept
+    return rec
+
+
 def _round(v: float, q: float = 0.1) -> float:
     return round(round(v / q) * q, 3)
 
@@ -168,7 +183,7 @@ def analyze(stats: TestStats, tune: Tune, discipline: str,
 
     for rule in (_rule_pressure, _rule_ride, _rule_camber, _rule_diff,
                  _rule_gearing, _rule_aero, _rule_arb, _rule_damping,
-                 _rule_camber_search):
+                 _rule_spring_balance, _rule_camber_search):
         if rule is _rule_ride:
             rec = _rule_ride(stats, tune, disc, tyre_reading, road_band, limits,
                              ride_locked)
@@ -197,7 +212,7 @@ def step_mult_for(aggressiveness: str) -> float:
 # and interact strongly, so they're rate-limited per lap.
 _EVIDENCE_GROUPS = {"pressure", "ride_height", "camber", "diff", "gearing", "aero",
                     "brakes", "alignment", "springs"}
-_SEARCH_GROUPS = {"arb", "damping_bump", "damping", "camber_search"}
+_SEARCH_GROUPS = {"arb", "damping_bump", "damping", "camber_search", "spring_balance"}
 
 
 def _kind_of(group: str) -> str:
@@ -213,7 +228,8 @@ def analyze_batch(stats: TestStats, tune: Tune, discipline: str,
                   bottoming_locked: Optional[set] = None,
                   step_mult: float = 1.0,
                   bottoming_attempts: Optional[dict] = None,
-                  lever_locked: Optional[set] = None) -> List[Recommendation]:
+                  lever_locked: Optional[set] = None,
+                  rejected_fields: Optional[set] = None) -> List[Recommendation]:
     """Build a BATCH for one test lap: ALL firing evidence-driven changes (each
     justified by its own measurement) plus up to `max_search` search-driven
     (handling-cluster) changes. Returns [] if nothing fires.
@@ -231,32 +247,59 @@ def analyze_batch(stats: TestStats, tune: Tune, discipline: str,
     work = tune.copy()
     evidence: List[Recommendation] = []
     search: List[Recommendation] = []
+    trace: List[str] = []        # per-iteration "which rules were eligible vs fired"
 
     for rule in (_rule_pressure, _rule_ride, _rule_camber, _rule_diff,
                  _rule_gearing, _rule_aero, _rule_arb, _rule_damping,
-                 _rule_camber_search):
+                 _rule_spring_balance, _rule_camber_search):
+        name = rule.__name__.replace("_rule_", "")
         if rule is _rule_ride:
             rec = _rule_ride(stats, work, discipline, tyre_reading, road_band, limits,
                              ride_locked, bottoming_locked, step_mult, bottoming_attempts)
-        elif rule is _rule_camber_search:
-            rec = _rule_camber_search(stats, work, discipline, tyre_reading, road_band,
-                                      limits, step_mult)
+        elif rule in (_rule_camber_search, _rule_spring_balance):
+            rec = rule(stats, work, discipline, tyre_reading, road_band, limits, step_mult)
         else:
             rec = rule(stats, work, discipline, tyre_reading, road_band, limits)
-        if not rec or not rec.is_change() or rec.group in converged:
+        if not rec or not rec.is_change():
+            trace.append(f"{name}=- (no signal)")
             continue
-        rec = _apply_limits(rec, work, limits)
-        if rec is None:
+        if rec.group in converged:
+            trace.append(f"{name}=SKIP(group '{rec.group}' converged/locked)")
             continue
-        rec = _filter_locked_levers(rec, work, lever_locked)
-        if rec is None:
+        capped = _apply_limits(rec, work, limits)
+        if capped is None:
+            trace.append(f"{name}=SKIP(clamped to no-op at the car's limit)")
+            continue
+        rec = capped
+        filt = _filter_locked_levers(rec, work, lever_locked)
+        if filt is None:
+            trace.append(f"{name}=SKIP(lever locked by anti-fixation: {list(rec.fields)})")
             continue                        # all fields locked -> not "a rule fired"
+        rec = filt
+        rj = _filter_rejected(rec, rejected_fields)
+        if rj is None:
+            trace.append(f"{name}=SKIP(rejected by user this session: {list(rec.fields)})")
+            continue
+        rec = rj
         rec.kind = _kind_of(rec.group)
+        trace.append(f"{name}=FIRE {rec.group}{list(rec.fields)}")
         for k, v in rec.fields.items():     # accumulate so later rules see it
             work.set(k, v)
         (evidence if rec.kind == "evidence" else search).append(rec)
 
-    return evidence + search[:max(0, max_search)]
+    batch = evidence + search[:max(0, max_search)]
+    chosen = {id(r) for r in batch}
+    # One line per iteration: every rule's verdict + reason, plus what made the cut.
+    # This is the diagnostic for "stuck on the same lever / never proposes springs".
+    _rlog.info("RULES dt=%s us/os=%.1f/%.1f corner_frames=%d | %s || batch=%s",
+               getattr(stats, "drivetrain", "?"), stats.slip_angle_front,
+               stats.slip_angle_rear, stats.n_corner_frames, "  ".join(trace),
+               [(r.group, r.fields) for r in batch])
+    deferred = [r for r in (evidence + search) if id(r) not in chosen]
+    if deferred:
+        _rlog.info("RULES deferred (over max_search=%d this lap): %s",
+                   max_search, [(r.group, r.fields) for r in deferred])
+    return batch
 
 
 def _apply_limits(rec: Recommendation, tune: Tune, limits: CarLimits) -> Optional[Recommendation]:
@@ -563,6 +606,48 @@ def _rule_damping(stats, tune, disc, tyre_reading, road_band, limits) -> Optiona
     return None
 
 
+# --- B''. spring-rate balance (only once the ARBs are saturated) -------------
+def _spring_cap(limits, lever: str, cur: float) -> float:
+    """Upper spring bound: the car's slider max if known, else don't more than
+    double the current rate (a sane ceiling so the search can't run away)."""
+    b = limits.bounds(lever)
+    return b[1] if b else cur * 2.0
+
+
+def _rule_spring_balance(stats, tune, disc, tyre_reading, road_band, limits,
+                         step_mult: float = 1.0) -> Optional[Recommendation]:
+    """Balance via SPRING RATE - reached only once the ARBs are SATURATED (rear at
+    its soft-floor and front at min for understeer, or the mirror for oversteer), so
+    it never fights the ARB rule. STIFFENS the grippy axle's mate (never softens, so
+    it can't induce bottoming). A lap-time/telemetry SEARCH lever: a bad move is
+    reverted and capped like any other, so it cannot lock in a regression."""
+    if stats.n_corner_frames < 10:
+        return None
+    fa, ra = stats.slip_angle_front, stats.slip_angle_rear
+    eps = 1e-6
+    arb_us_saturated = tune.arb_r >= ARB_REAR_SOFT_FLOOR - eps and tune.arb_f <= ARB_MIN + eps
+    arb_os_saturated = tune.arb_r <= ARB_MIN + eps and tune.arb_f >= ARB_MAX - eps
+    if fa - ra > US_DEG and arb_us_saturated:
+        new = _round(min(_spring_cap(limits, "spring_r", tune.spring_r),
+                         tune.spring_r + _spring_step(tune.spring_r) * step_mult))
+        if new > tune.spring_r + eps:
+            return Recommendation("spring_balance", {"spring_r": new},
+                f"Understeer persists with ARBs saturated (rear {tune.arb_r:.0f}, front "
+                f"{tune.arb_f:.0f}) - stiffening the REAR spring shifts grip to the front.",
+                "Front bites harder; rotation improves where the ARB can no longer help.",
+                f"Rear spring {tune.spring_r:.1f} -> {new:.1f} kgf/mm")
+    if ra - fa > OS_DEG and arb_os_saturated:
+        new = _round(min(_spring_cap(limits, "spring_f", tune.spring_f),
+                         tune.spring_f + _spring_step(tune.spring_f) * step_mult))
+        if new > tune.spring_f + eps:
+            return Recommendation("spring_balance", {"spring_f": new},
+                f"Oversteer persists with ARBs saturated (rear {tune.arb_r:.0f}, front "
+                f"{tune.arb_f:.0f}) - stiffening the FRONT spring shifts grip to the rear.",
+                "Rear plants where the ARB can no longer help; less mid-corner snap.",
+                f"Front spring {tune.spring_f:.1f} -> {new:.1f} kgf/mm")
+    return None
+
+
 # --- E. diff ----------------------------------------------------------------
 def _rule_diff(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[Recommendation]:
     os_thresh = _diff_slip_thresh(disc, ON_POWER_OS_SLIP, ON_POWER_OS_SLIP_DIRT)
@@ -570,8 +655,13 @@ def _rule_diff(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[R
     entry_thresh = _diff_slip_thresh(disc, ENTRY_INSTAB_SLIP, ENTRY_INSTAB_SLIP_DIRT)
     # dirt/CC keep a driveability floor on the accel diff (open rear = no drive)
     accel_floor = DIRT_ACCEL_DIFF_FLOOR if disc in _DIRT_LIKE else 0.0
-    # on-power oversteer: rear slip rising on throttle (threshold is dirt-aware)
-    if stats.on_throttle_rear_slip > os_thresh and \
+    # DRIVETRAIN-AWARE: only touch a diff the car actually has. The rear accel/decel
+    # diffs exist on RWD+AWD; the centre diff is AWD-only; FWD drives the FRONT axle,
+    # so it gets a FRONT accel diff (never rear/centre - those would be nonsense).
+    dt = stats.drivetrain
+    rear_driven = dt in ("RWD", "AWD")
+    # on-power oversteer on a DRIVEN rear axle -> ease the rear accel diff
+    if rear_driven and stats.on_throttle_rear_slip > os_thresh and \
             stats.on_throttle_rear_slip > stats.on_throttle_front_slip:
         new = _clamp(tune.diff_rear_accel - DIFF_STEP, accel_floor, 100.0)
         if new != tune.diff_rear_accel:
@@ -582,8 +672,19 @@ def _rule_diff(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[R
                 f"under throttle (> {os_thresh}).",
                 "Cleaner corner exits; rear lays power down without stepping out.",
                 f"Rear accel diff {tune.diff_rear_accel:.0f} -> {new:.0f} %{floor_note}")
+    # FWD on-power understeer: the DRIVEN front wheels spin/scrabble under throttle ->
+    # ease the FRONT accel diff so the inside wheel frees up and the nose rotates.
+    if dt == "FWD" and stats.on_throttle_front_slip > os_thresh \
+            and stats.on_throttle_front_slip > stats.on_throttle_rear_slip:
+        new = _clamp(tune.diff_front_accel - DIFF_STEP, 0.0, 100.0)
+        if new != tune.diff_front_accel:
+            return Recommendation("diff", {"diff_front_accel": _round(new, 1)},
+                f"FWD on-power front wheelspin: front slip ratio "
+                f"{stats.on_throttle_front_slip:.2f} under throttle (> {os_thresh}).",
+                "Inside front frees up; less power-on understeer and torque steer.",
+                f"Front accel diff {tune.diff_front_accel:.0f} -> {new:.0f} %")
     # AWD exit understeer: front slip rising on throttle -> send more torque rear
-    if stats.drivetrain == "AWD" and stats.on_throttle_front_slip > us_thresh \
+    if dt == "AWD" and stats.on_throttle_front_slip > us_thresh \
             and stats.on_throttle_front_slip > stats.on_throttle_rear_slip:
         new = _clamp(tune.diff_center + DIFF_STEP, 0.0, DIFF_CENTER_MAX)
         if new != tune.diff_center:
@@ -592,8 +693,9 @@ def _rule_diff(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[R
                 "on throttle (front scrabbling).",
                 "Nose stops pushing on exit; more drive comes from the rear.",
                 f"Center diff {tune.diff_center:.0f} -> {new:.0f} % to rear")
-    # entry instability under braking
-    if stats.braking_rear_slip > entry_thresh:
+    # entry instability under braking -> ease the rear decel diff (rear-driven cars
+    # have one; FWD's engine braking is on the front, so skip it there)
+    if rear_driven and stats.braking_rear_slip > entry_thresh:
         new = _clamp(tune.diff_rear_decel - DIFF_STEP, 0.0, 100.0)
         if new != tune.diff_rear_decel:
             return Recommendation("diff", {"diff_rear_decel": _round(new, 1)},

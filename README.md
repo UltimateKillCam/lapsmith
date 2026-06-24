@@ -61,6 +61,28 @@ There's a **Max tuning time** setting (default **20 minutes**; set **0** for unl
 
 It's a **ceiling, not a target**: if the tool converges first (every lever improved-or-locked, nothing left to try) it stops and saves immediately, with time to spare — it never idles or re-tests just to fill the clock. On expiry it finishes the test already in progress (never a half-tested change), runs the honest final check, then stops. The overlay shows the time remaining; the saved status reads `converged` or `stopped: time budget` accordingly.
 
+## Console / Xbox (telemetry over the LAN)
+
+LapSmith runs on a **Windows PC**, not on the console. If you play Forza on an Xbox/console, it can stream its Data Out telemetry across your home network to the PC running LapSmith — the tuning works exactly the same, with one difference (below).
+
+Turn on **Console mode** (in the setup form, or **Settings → Console mode**). Then on the console, in Forza's **HUD & Gameplay → Data Out / telemetry** settings:
+
+- **Data Out: ON**
+- **IP address:** your PC's LAN IP — LapSmith shows it when Console mode is on (e.g. `192.168.1.42`)
+- **Port:** the same port as LapSmith (default `5607`)
+- **Format: Dash** (the "car dash" / Sled+Dash layout — that's the one with tyre temps)
+
+Both devices must be on the same network, and Windows Firewall must allow LapSmith to receive UDP on that port (accept the prompt on first run). In Console mode LapSmith listens on all interfaces so it can receive the console's packets; on PC it stays on loopback.
+
+**The one caveat — camber/toe accuracy.** On PC, LapSmith reads the in-game tyre **Heat** screen to get three temperatures per tyre (inner/middle/outer), which is what pins down camber and toe. There's no way to screenshot that screen on a console, so in Console mode tyre temps fall back to the **single** per-corner temperature in the UDP packet. That's still enough for pressure (left/right balance) and everything else, but **camber and toe are less accurate** and get tuned by lap time instead. LapSmith shows a clear notice while Console mode is on.
+
+## Progress, why-reasons, and rejecting changes
+
+- **Progress** — the overlay always shows *"Confirmed gains: N · Best so far: T (±Δ vs start)"* and a plain trend (**Improving** / **Fine-tuning** / **Not finding much — may finish soon**), so you can always tell if it's getting anywhere. If it stalls it says so instead of grinding silently.
+- **Why** — every proposed change shows a one-line reason tied to the real telemetry that triggered it (e.g. *"On-power oversteer: rear slip 0.45 under throttle"*).
+- **Fewer re-test laps** — LapSmith reads your inputs (throttle/brake/steering, binned by track position) to tell a tune gain from you just driving better. If a faster lap came with notably different inputs, it credits *you* and moves on **without** a full A/B/A re-drive; it only re-tests when the inputs look the same but the result moved. (Inputs don't fully isolate driver from tune, so A/B/A stays the tiebreaker — just used far less.)
+- **Reject** — don't want a suggestion? Press **[F10]**. It isn't applied, that lever is **locked for the rest of the session** (never suggested again), the loop continues and can still converge, and the rejection is logged.
+
 ## Reading the overlay
 
 Overlay states come in two unmistakable colours. **Amber "CHANGE THESE NOW"** means edit the tune menu — it lists the exact fields as *from → to* (only what changed, including any revert) and ends with "press F8 when applied". **Green** means just drive, hands off the menu — `WARM-UP`, `OUT-LAP` (neither counted), `MEASURING — lap x/y` (a counted lap), `RE-ANCHOR`, or `FINAL CHECK`.

@@ -6,7 +6,7 @@ import sys
 # The single source of truth for the product name. Use this for ALL user-facing
 # strings (window titles, overlay header, dialogs, tray, help, file headers).
 PRODUCT_NAME = "LapSmith"
-__version__ = "0.1.9"
+__version__ = "0.1.13"
 
 
 def resource_path(rel: str) -> str:

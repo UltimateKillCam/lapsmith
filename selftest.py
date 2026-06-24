@@ -944,7 +944,7 @@ def test_dirt_diff_and_lever_cap():
           and not any("diff_rear_accel" in r.fields for r in lock_b))
 
 
-def _telem_lap(lap_time, exit_g=1.0, grip=1.2, slip=0.30, n=150):
+def _telem_lap(lap_time, exit_g=1.0, grip=1.2, slip=0.30, n=150, brk=0, thr_corner=90):
     """One lap of synthetic telemetry binnable by track position: corner bins (lateral
     g), corner-exit bins (throttle-on forward g + rear slip), and straights.
     `exit_g` is the corner-exit forward g (the 'how quickly it accelerates' channel);
@@ -959,7 +959,8 @@ def _telem_lap(lap_time, exit_g=1.0, grip=1.2, slip=0.30, n=150):
         if ph < 12:                       # corner: high lateral g, partial throttle
             v["accel_x"] = grip * 9.80665
             v["accel_z"] = 0.0
-            v["accel"] = 90
+            v["accel"] = thr_corner       # driver-input knob (throttle in the corner)
+            v["brake"] = brk              # driver-input knob (brake in the corner)
             v["speed"] = 26.0
             v["steer"] = 70
         elif ph < 22:                     # corner exit: on throttle, forward g + slip
@@ -1224,6 +1225,358 @@ def test_checklists_and_overlay_states():
     c._on_lap(LapResult(c.lap_number + 1, 58.0, _telem_lap(58.0, exit_g=1.0)))
     check("(4/minor) a clock cutoff saves stop_reason 'stopped: time budget' (not 'converged')",
           c.phase == C.DONE and c.stop_reason == "stopped: time budget (20 min)")
+
+
+def test_console_mode():
+    print("\n== console mode: LAN bind, OCR skipped, single-temp fallback, camber degrade ==")
+    from lapsmith.gui import controller as C
+    from lapsmith.knowledge import fitness, rules
+    from lapsmith.knowledge.rules import Recommendation
+    from lapsmith.state.tune_state import Tune, CarLimits
+    from lapsmith.telemetry.session import TestStats
+    from lapsmith.telemetry.listener import TelemetryListener
+    from lapsmith.telemetry.laps import LapResult
+    from lapsmith import identity
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+
+    # --- 2) LAN bind: PC=loopback, console=all interfaces (PC path unchanged) ----
+    c = C.Controller(); c.identity = ident
+    check("PC mode binds loopback (127.0.0.1)", c._bind_host() == "127.0.0.1")
+    c.set_console_mode(True)
+    check("console mode binds all interfaces (0.0.0.0) for LAN telemetry",
+          c.console_mode and c._bind_host() == "0.0.0.0")
+    # the listener actually carries the host through to the socket bind target
+    c.listener = TelemetryListener(port=5651, host=c._bind_host())   # constructed, not started
+    c.set_console_mode(False)
+    check("toggling back rebinds the listener to loopback (live, no restart)",
+          c.listener.host == "127.0.0.1")
+    check("LAN IP is surfaced for the console's Data Out target",
+          isinstance(c.lan_ip(), str) and c.lan_ip().count(".") == 3)
+
+    # --- 3) console mode skips OCR/screenshot entirely (no error) ----------------
+    c = C.Controller(); c.identity = ident
+    c.apply_setup("road", CarLimits(), console_mode=True)
+    called = {"ocr": False}
+    def _boom():
+        called["ocr"] = True
+        raise AssertionError("console mode must NOT screenshot/OCR")
+    c.lap_heat_fn = _boom
+    c.tyre_reading = {"FL": {"inner": 95, "outer": 80}}      # stale 3-zone reading
+    c._read_lap_heat()
+    check("console: screenshot/OCR step skipped (lap_heat_fn never called)", not called["ocr"])
+    check("console: tyre_reading cleared to None (no fabricated 3-zone data)",
+          c.tyre_reading is None and "console" in c.last_reader)
+
+    # --- 3) camber/toe degrade; pressure still uses the single per-corner temps --
+    s = aggregate(_window("understeer"))
+    check("console: zone-based camber rule does NOT fire without a 3-zone reading",
+          rules._rule_camber(s, Tune(), "road", None, True, CarLimits()) is None)
+    reading = {k: {"inner": 95, "middle": 88, "outer": 80} for k in ("FL", "FR")}
+    reading.update({k: {"inner": 84, "middle": 83, "outer": 82} for k in ("RL", "RR")})
+    rc = rules._rule_camber(s, Tune(), "road", reading, True, CarLimits())
+    check("PC mode: a 3-zone reading still drives a confident camber change",
+          rc is not None and "camber" in rc.group)
+    st = TestStats(temp_fl=96.0, temp_fr=80.0, temp_rl=85.0, temp_rr=85.0, n_corner_frames=50)
+    rp = rules._rule_pressure(st, Tune(), "road", None, True, CarLimits())
+    check("console: single per-corner temps still drive the pressure rule (L/R balance)",
+          rp is not None and rp.group == "pressure")
+    # with NO reading, analyze falls back to lap-time camber_search (graceful degrade)
+    rec = rules.analyze(aggregate(_window("understeer")), Tune(), "road", tyre_reading=None)
+    check("console: camber degrades to lap-time search (never confident off missing data)",
+          rec is None or rec.group != "camber")
+
+    # --- 5) end to end in console mode: loop runs, OCR skipped, notice shown ------
+    cc = C.Controller(); cc.identity = ident
+    cc.apply_setup("road", CarLimits(), console_mode=True, rigour="quick")
+    cc.mode = C.MODE_AUTO; cc.laps_per_test = 1
+    cc.best_segment = 60.0; cc._baseline_lap_s = 60.0
+    cc._ref_telem = fitness.bin_lap(_telem_lap(60.0, exit_g=1.0))
+    cc._baseline_telem = cc._ref_telem
+    cc._on_car = cc.state.current.as_dict()
+    cc.lap_heat_fn = _boom                          # would raise if console didn't skip OCR
+    cc.batch = [Recommendation("diff", {"diff_rear_accel": 70.0}, "t", "")]; cc.change_applied()
+    cc._on_lap(LapResult(cc.lap_number + 1, 91.3, _telem_lap(91.3)))           # out-lap (reads heat)
+    cc._on_lap(LapResult(cc.lap_number + 1, 59.4, _telem_lap(59.4, exit_g=1.35)))  # measured
+    check("console: end-to-end measurement runs, OCR skipped, change gated normally",
+          not called["ocr"] and cc.state.current.get("diff_rear_accel") == 70.0)
+    stt = cc.status()
+    check("console: honest notice + LAN IP surfaced in status",
+          stt["console_mode"] and "less accurate" in (stt["console_notice"] or "").lower()
+          and stt["lan_ip"])
+
+    # --- PC mode unchanged: OCR path still runs (tyre_reading honoured) -----------
+    cp = C.Controller(); cp.identity = ident
+    cp.apply_setup("road", CarLimits(), console_mode=False)
+    check("PC mode: console flag off, OCR path intact",
+          not cp.console_mode and cp.status()["console_mode"] is False
+          and cp.status()["console_notice"] is None)
+
+
+def test_troubleshooting_v0110():
+    print("\n== troubleshooting: oscillation=fixation, springs reachable, drivetrain-aware diff ==")
+    from lapsmith.gui import controller as C
+    from lapsmith.knowledge import rules
+    from lapsmith.state.tune_state import Tune, CarLimits
+    from lapsmith.telemetry.session import TestStats
+    from lapsmith import identity
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+
+    # --- #1: a revert-then-re-apply OSCILLATION on one lever counts as fixation ----
+    c = C.Controller(); c.identity = ident
+    c.apply_setup("road", CarLimits()); c.mode = C.MODE_AUTO
+    c.best_segment = 50.0
+    c.state.current.set("ride_height_r", 6.0)
+    c._last_improving = {"ride_height_r": 6.0}
+    for _ in range(rules.LEVER_NOIMPROVE_CAP):
+        rec = c.state.apply_change("ride_height", {"ride_height_r": 7.0}, "t", "")   # raise (up)
+        c._applied_records = [rec]
+        c._apply_fitness_multi(50.0, 0.0)                                            # neutral -> revert
+    check("#1 apply->revert->apply->revert on one lever increments the fixation counter & LOCKS",
+          "ride_height_r:up" in c._lever_locked
+          and c._noimprove.get("ride_height_r:up") == rules.LEVER_NOIMPROVE_CAP
+          and abs(c.state.current.get("ride_height_r") - 6.0) < 1e-6)   # rolled back, not drifted
+
+    # --- #3: springs are REACHABLE once the ARBs are saturated --------------------
+    us = TestStats(slip_angle_front=4.0, slip_angle_rear=2.0, n_corner_frames=30)   # understeer
+    sat = Tune(); sat.arb_r = rules.ARB_REAR_SOFT_FLOOR; sat.arb_f = rules.ARB_MIN  # ARB saturated
+    sb = rules._rule_spring_balance(us, sat, "road", None, True, CarLimits())
+    check("#3 ARB saturated + understeer -> spring-balance STIFFENS the rear spring",
+          sb is not None and sb.group == "spring_balance" and "spring_r" in sb.fields
+          and sb.fields["spring_r"] > sat.spring_r)
+    notsat = Tune(); notsat.arb_r = rules.ARB_REAR_SOFT_FLOOR; notsat.arb_f = 6.0    # ARB can still move
+    check("#3 spring-balance stays silent while the ARB can still move (never fights ARB)",
+          rules._rule_spring_balance(us, notsat, "road", None, True, CarLimits()) is None)
+    batch = rules.analyze_batch(us, sat, "road", tyre_reading=None, max_search=3)
+    check("#3 springs reachable in the NORMAL flow (analyze_batch emits spring_balance)",
+          any(r.group == "spring_balance" for r in batch))
+
+    # --- #2/#4: the diff rule only offers a diff the car actually HAS --------------
+    t = Tune()
+    fwd = TestStats(drivetrain="FWD", on_throttle_front_slip=0.5, on_throttle_rear_slip=0.1,
+                    n_corner_frames=20)
+    rf = rules._rule_diff(fwd, t, "road", None, True, CarLimits())
+    check("#2 FWD -> FRONT diff only (no rear accel, no centre diff)",
+          rf is not None and "diff_front_accel" in rf.fields
+          and "diff_rear_accel" not in rf.fields and "diff_center" not in rf.fields)
+    fwd_rear = TestStats(drivetrain="FWD", on_throttle_rear_slip=0.9, on_throttle_front_slip=0.1,
+                         n_corner_frames=20)
+    rfr = rules._rule_diff(fwd_rear, t, "road", None, True, CarLimits())
+    check("#2 FWD never gets a REAR-diff change even with rear slip (it has no rear diff)",
+          rfr is None or "diff_rear_accel" not in rfr.fields)
+    rwd = TestStats(drivetrain="RWD", on_throttle_rear_slip=0.5, on_throttle_front_slip=0.1,
+                    n_corner_frames=20)
+    rr = rules._rule_diff(rwd, t, "road", None, True, CarLimits())
+    check("#4 RWD -> rear accel diff, NO centre diff",
+          rr is not None and "diff_rear_accel" in rr.fields and "diff_center" not in rr.fields)
+    awd = TestStats(drivetrain="AWD", on_throttle_front_slip=0.5, on_throttle_rear_slip=0.1,
+                    n_corner_frames=20)
+    ra = rules._rule_diff(awd, t, "road", None, True, CarLimits())
+    check("#4 AWD exit understeer -> centre diff (AWD-only branch)",
+          ra is not None and "diff_center" in ra.fields)
+
+    # --- #2: manual drivetrain override beats a (mis)detected DrivetrainType -------
+    co = C.Controller(); co.identity = ident
+    co.apply_setup("road", CarLimits(), drivetrain="FWD")
+    check("#2 manual override sets the effective drivetrain (FWD)",
+          co.effective_drivetrain() == "FWD")
+    co.stats = TestStats(drivetrain="AWD", on_throttle_front_slip=0.5, on_throttle_rear_slip=0.1,
+                         n_corner_frames=20)
+    co.tyre_reading = None
+    co._compute_batch()
+    diffs = [r for r in co.batch if r.group == "diff"]
+    check("#2 override forces an AWD-detected car to be tuned as FWD (front diff only)",
+          co.stats.drivetrain == "FWD" and diffs
+          and all("diff_rear_accel" not in r.fields and "diff_center" not in r.fields
+                  for r in diffs))
+    co.apply_setup("road", CarLimits(), drivetrain="auto")
+    check("#2 'auto' clears the override (back to detected drivetrain)",
+          co.drivetrain_override is None)
+
+
+def test_ux_v0112():
+    print("\n== UX: input-based A/B/A discount, reject-locks-session, progress reporting ==")
+    from lapsmith.gui import controller as C
+    from lapsmith.knowledge import fitness, rules
+    from lapsmith.knowledge.rules import Recommendation
+    from lapsmith.state.tune_state import Tune, CarLimits
+    from lapsmith.telemetry.laps import LapResult
+    from lapsmith import identity
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+
+    # --- driver-input profile is live and detects different driving ---------------
+    ref = fitness.bin_lap(_telem_lap(60.0, exit_g=1.0))
+    same = fitness.bin_lap(_telem_lap(60.0, exit_g=1.35))            # same inputs, better car
+    diff = fitness.bin_lap(_telem_lap(60.0, exit_g=1.35, brk=200))   # braking very differently
+    check("driver-input channels are live and binned", ref.inputs_live and diff.inputs_live)
+    check("input_difference ~0 when the driver drove the same",
+          0 <= fitness.input_difference(same, ref) <= fitness.INPUT_DRIVER_THRESH)
+    check("input_difference is large when the driver drove differently",
+          fitness.input_difference(diff, ref) > fitness.INPUT_DRIVER_THRESH)
+
+    def ctrl(rigour="confirmed"):
+        c = C.Controller(); c.identity = ident
+        c.apply_setup("road", CarLimits(), rigour=rigour)
+        c.mode = C.MODE_AUTO; c.laps_per_test = 1
+        c.best_segment = 60.0; c._baseline_lap_s = 60.0; c._session_start_best = 60.0
+        c._ref_telem = fitness.bin_lap(_telem_lap(60.0, exit_g=1.0))
+        c._baseline_telem = c._ref_telem
+        c._on_car = c.state.current.as_dict()
+        return c
+
+    def measure(c, lap_time, **telem):
+        c._reanchor_pending = False; c._iters_since_reanchor = 0
+        c.batch = [Recommendation("diff", {"diff_rear_accel": 70.0}, "t", "")]
+        c.change_applied()
+        c._on_lap(LapResult(c.lap_number + 1, 91.3, _telem_lap(91.3)))
+        c._on_lap(LapResult(c.lap_number + 1, lap_time, _telem_lap(lap_time, **telem)))
+
+    # --- #1: apparent gain with DIFFERENT inputs -> DISCOUNT, no A/B/A -------------
+    c = ctrl()
+    measure(c, 59.5, exit_g=1.35, brk=200)       # looks faster AND drove very differently
+    check("#1 apparent gain explained by driver inputs -> discounted, A/B/A SKIPPED",
+          c._aba is None and c._aba_saved == 1
+          and c.state.current.get("diff_rear_accel") != 70.0)     # not kept
+    # --- #1: apparent gain with SAME inputs -> still A/B/A (inconclusive) ----------
+    c = ctrl()
+    measure(c, 59.5, exit_g=1.35, brk=0)         # faster, same inputs -> can't tell -> A/B/A
+    check("#1 apparent gain with similar inputs still triggers A/B/A (the tiebreaker)",
+          c._aba is not None and c.phase == C.SHOW_CHANGE
+          and c.batch[0].group == "confirm_revert" and c._aba_saved == 0)
+
+    # --- #5: rejecting a change LOCKS it for the session; loop continues -----------
+    c = C.Controller(); c.identity = ident
+    c.apply_setup("road", CarLimits()); c.mode = C.MODE_AUTO
+    c.best_segment = 55.0
+    c.stats = aggregate(_window("understeer")); c.tyre_reading = None
+    c._compute_batch()
+    rejected = set().union(*[set(r.fields) for r in c.batch]) if c.batch else set()
+    check("a change is proposed to reject", c.phase == C.SHOW_CHANGE and rejected)
+    c.reject_change()
+    check("#5 reject locks the proposed lever(s) for the session (not applied)",
+          rejected and rejected <= c._rejected_fields)
+    reappeared = False
+    for _ in range(6):
+        c.stats = aggregate(_window("understeer")); c.tyre_reading = None
+        c._compute_batch()
+        if c.batch and (set().union(*[set(r.fields) for r in c.batch]) & c._rejected_fields):
+            reappeared = True
+        if not c.batch or c.phase == C.DONE:
+            break
+    check("#5 a rejected lever is never proposed again this session", not reappeared)
+    # rejected fields don't block convergence: analyze with everything rejected -> []
+    s = aggregate(_window("understeer"))
+    allf = set().union(*[set(r.fields) for r in
+                         rules.analyze_batch(s, Tune(), "road", tyre_reading=None, max_search=5)])
+    empty = rules.analyze_batch(s, Tune(), "road", tyre_reading=None, max_search=5,
+                                rejected_fields=allf)
+    check("#5 rejecting all firing levers converges (analyze_batch -> []), never blocks",
+          empty == [])
+
+    # --- #2: progress state reports best-vs-start, confirmed gains, trend ----------
+    c = ctrl()
+    p0 = c.progress_state()
+    check("#2 progress reports best-vs-start + confirmed-gains + a plain trend",
+          p0["delta_vs_start_s"] == 0.0 and p0["confirmed_gains"] == 0 and p0["trend"])
+    c._record_outcome("gain"); c.best_segment = 59.1
+    p1 = c.progress_state()
+    check("#2 a confirmed gain is counted and best-vs-start updates",
+          p1["confirmed_gains"] == 1 and p1["delta_vs_start_s"] < -0.05
+          and p1["trend"] in ("Improving", "Fine-tuning"))
+    for _ in range(4):
+        c._record_outcome("revert")
+    check("#2 a dry spell reports 'Not finding much - may finish soon'",
+          "finish soon" in c.progress_state()["trend"])
+
+    # --- #4: each proposed change carries a telemetry-tied 'why' -------------------
+    c = C.Controller(); c.identity = ident
+    c.apply_setup("road", CarLimits()); c.mode = C.MODE_AUTO
+    c.best_segment = 55.0; c.stats = aggregate(_window("understeer")); c.tyre_reading = None
+    c._compute_batch()
+    ui = c.ui_state()
+    check("#4 the action overlay carries a one-line WHY tied to the telemetry + a reject option",
+          ui["klass"] == "action" and ui.get("why") and ui.get("can_reject")
+          and any(ch.isdigit() for ch in " ".join(ui["why"])))   # references a measured number
+
+
+def test_critical_fixes_v0113():
+    print("\n== critical: crash-safe logs, save-on-exit, final=best-confirmed, on-car F8-only ==")
+    import os, json, tempfile
+    from lapsmith.gui import controller as C
+    from lapsmith.knowledge.rules import Recommendation
+    from lapsmith.state.tune_state import CarLimits
+    from lapsmith.state import store
+    from lapsmith import identity
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+    store.set_sessions_dir(tempfile.mkdtemp(prefix="lapsmith_sessions_"))
+
+    def ctrl():
+        c = C.Controller(); c.identity = ident; c.persist = True
+        c.apply_setup("road", CarLimits())     # opens the session log + writes a row
+        return c
+
+    # --- #1: the session log is written INCREMENTALLY (flushed each line) ----------
+    c = ctrl()
+    logp = store.session_log_path(c._meta()["car"], c.discipline)
+    c.log("incremental-marker-XYZ")
+    check("#1 per-session log exists and is flushed mid-session (crash-safe)",
+          os.path.exists(logp) and "incremental-marker-XYZ" in open(logp, encoding="utf-8").read())
+    sp = store.session_path(c._meta()["car"], c.discipline)
+    check("#1 a session row is written as soon as the session starts (not only at the end)",
+          os.path.exists(sp) and json.load(open(sp, encoding="utf-8"))["status"] == "in_progress")
+
+    # --- #2 + #3: abnormal exit saves the BEST CONFIRMED tune, never baseline-drift -
+    c = ctrl()
+    c._baseline_lap_s = 60.0
+    base_arb = c.state.current.get("arb_r")
+    # a confirmed gain: arb_r changed, best 59.0, snapshot taken
+    c.state.current.set("arb_r", base_arb - 5)
+    c._best_tune = c.state.current.copy(); c._best_tune_lap = 59.0
+    c.best_segment = 59.0; c._confirmed_gains = 1
+    # ...then state.current DRIFTS back to the baseline (e.g. mid-A/B/A revert)
+    c.state.current.set("arb_r", base_arb)
+    check("the live tune drifted back to baseline (the bug-3 trap)",
+          c.state.current.get("arb_r") == base_arb)
+    c.save_on_exit()                            # simulates the window-X / force-close path
+    data = json.load(open(store.session_path(c._meta()["car"], c.discipline), encoding="utf-8"))
+    check("#3 saved final tune = BEST CONFIRMED (arb_r kept), NOT the reverted baseline",
+          data["final_tune"]["arb_r"] == base_arb - 5)
+    check("#3 saved best lap = the confirmed gain (59.0), not the baseline 60.0",
+          data["best_lap_s"] == 59.0)
+    check("#2 an abnormally-ended session is still written to history",
+          data["status"] == "interrupted")
+    check("#2 the session log is flushed + closed on exit", c._session_log is None)
+
+    # nothing confirmed -> honestly saves the baseline
+    c2 = ctrl(); c2._baseline_lap_s = 61.0
+    c2.save_on_exit()
+    d2 = json.load(open(store.session_path(c2._meta()["car"], c2.discipline), encoding="utf-8"))
+    check("#3 with NO confirmed gain, the saved tune is the baseline (honest)",
+          d2["final_tune"] == c2.baseline.as_dict())
+
+    # --- #4: on-car state only changes on a real F8 apply (no phantom reverts) -----
+    c = C.Controller(); c.identity = ident
+    c.apply_setup("road", CarLimits()); c.mode = C.MODE_AUTO
+    c.best_segment = 55.0; c.stats = aggregate(_window("understeer")); c.tyre_reading = None
+    on_car_before = dict(c._on_car)
+    c._compute_batch()                          # PROPOSE a change (not applied yet)
+    check("a change is proposed", c.phase == C.SHOW_CHANGE and c.batch)
+    check("#4 proposing a change does NOT touch the on-car state (no pre-confirm record)",
+          c._on_car == on_car_before)
+    proposed = set().union(*[set(r.fields) for r in c.batch])
+    c.reject_change()                           # REJECT it
+    check("#4 rejecting a change does NOT touch the on-car state either",
+          c._on_car == on_car_before)
+    # a rejected/never-applied lever never appears as a 'revert' in the checklist
+    revert_fields = {it["field"] for it in c.menu_checklist()}
+    check("#4 no phantom revert: a never-applied lever is never in the revert checklist",
+          not (proposed & revert_fields) and not (proposed & set(c._on_car)))
+    # and after a REAL F8 apply, the on-car state DOES update (atomic with the change)
+    c.stats = aggregate(_window("understeer")); c.tyre_reading = None; c._compute_batch()
+    if c.phase == C.SHOW_CHANGE and c.batch:
+        applied = set().union(*[set(r.fields) for r in c.batch])
+        c.change_applied()
+        check("#4 the on-car state updates ONLY on the real F8 apply",
+              applied <= set(c._on_car))
 
 
 def test_batch_changes():
@@ -2115,6 +2468,10 @@ if __name__ == "__main__":
     test_dirt_diff_and_lever_cap()
     test_telemetry_primary_fitness()
     test_checklists_and_overlay_states()
+    test_console_mode()
+    test_troubleshooting_v0110()
+    test_ux_v0112()
+    test_critical_fixes_v0113()
     test_batch_changes()
     test_multi_lap_fitness()
     test_lateral_capture_axis()

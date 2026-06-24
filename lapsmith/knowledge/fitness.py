@@ -51,9 +51,15 @@ class LapTelemetry:
     steer: List[float] = field(default_factory=list)      # mean |steer|
     corner: List[bool] = field(default_factory=list)      # was this bin a corner?
     onthrottle: List[bool] = field(default_factory=list)  # was this bin throttle-on?
+    # DRIVER INPUTS per bin (0..1) - how the human drove this lap, used to tell a
+    # driver-improvement gain apart from a tune gain WITHOUT a full A/B/A re-test.
+    throttle: List[float] = field(default_factory=list)   # mean throttle (accel/255)
+    brake: List[float] = field(default_factory=list)      # mean brake (brake/255)
+    steer_in: List[float] = field(default_factory=list)   # mean |steer|/127
     n_frames: int = 0
     pos_src: str = "none"        # which field gave track position
     live: bool = False           # do the channels carry real signal?
+    inputs_live: bool = False    # do the driver-input channels carry signal?
 
 
 def _track_positions(pkts: List[Packet]):
@@ -71,7 +77,9 @@ def bin_lap(packets: List[Packet], n_bins: int = TELEM_BINS) -> LapTelemetry:
     """Reduce a lap (or merged laps) of packets to per-track-position-bin channels."""
     lt = LapTelemetry(grip=[0.0] * n_bins, exit_g=[0.0] * n_bins, slip=[0.0] * n_bins,
                       speed=[0.0] * n_bins, steer=[0.0] * n_bins,
-                      corner=[False] * n_bins, onthrottle=[False] * n_bins)
+                      corner=[False] * n_bins, onthrottle=[False] * n_bins,
+                      throttle=[0.0] * n_bins, brake=[0.0] * n_bins,
+                      steer_in=[0.0] * n_bins)
     pkts = [p for p in packets if p.is_race_on] or list(packets)
     pkts = [p for p in pkts if p.speed > 1.0] or pkts
     lt.n_frames = len(pkts)
@@ -87,7 +95,10 @@ def bin_lap(packets: List[Packet], n_bins: int = TELEM_BINS) -> LapTelemetry:
     thr_cnt = [0] * n_bins
     exit_acc = [0.0] * n_bins
     slip_acc = [0.0] * n_bins
-    any_grip = any_exit = False
+    thr_in_acc = [0.0] * n_bins
+    brk_in_acc = [0.0] * n_bins
+    str_in_acc = [0.0] * n_bins
+    any_grip = any_exit = any_input = False
     for p, x in zip(pkts, pos):
         b = min(n_bins - 1, max(0, int((x - lo) / span * n_bins)))
         cnt[b] += 1
@@ -95,6 +106,11 @@ def bin_lap(packets: List[Packet], n_bins: int = TELEM_BINS) -> LapTelemetry:
         g_acc[b] += latg
         sp_acc[b] += p.speed
         st_acc[b] += abs(p.steer)
+        thr_in_acc[b] += min(1.0, p.accel / 255.0)         # driver inputs (0..1)
+        brk_in_acc[b] += min(1.0, p.brake / 255.0)
+        str_in_acc[b] += min(1.0, abs(p.steer) / 127.0)
+        if p.accel > 4 or p.brake > 4 or abs(p.steer) > 2:
+            any_input = True
         if latg >= HIGH_G_THRESHOLD:
             corner_cnt[b] += 1
             any_grip = True
@@ -111,19 +127,54 @@ def bin_lap(packets: List[Packet], n_bins: int = TELEM_BINS) -> LapTelemetry:
             lt.speed[b] = sp_acc[b] / cnt[b]
             lt.steer[b] = st_acc[b] / cnt[b]
             lt.corner[b] = corner_cnt[b] >= max(1, cnt[b] // 3)
+            lt.throttle[b] = thr_in_acc[b] / cnt[b]
+            lt.brake[b] = brk_in_acc[b] / cnt[b]
+            lt.steer_in[b] = str_in_acc[b] / cnt[b]
         if thr_cnt[b]:
             lt.exit_g[b] = exit_acc[b] / thr_cnt[b]
             lt.slip[b] = slip_acc[b] / thr_cnt[b]
             lt.onthrottle[b] = True
     lt.live = any_grip and any_exit
+    lt.inputs_live = any_input
     return lt
+
+
+# A driver who brakes/accelerates/steers NOTABLY differently this lap than on the
+# reference lap can produce a faster time without the TUNE changing at all. This
+# threshold (mean per-bin per-channel input difference, 0..1) is "notably different".
+INPUT_DRIVER_THRESH = 0.06
+
+
+def input_difference(cand: LapTelemetry, ref: LapTelemetry) -> float:
+    """Mean per-track-position-bin difference in the DRIVER's inputs (throttle, brake,
+    steering) between two measurements, 0..1. Large = the human drove differently, so
+    an apparent gain is likely the DRIVER, not the tune. Returns -1.0 if inputs aren't
+    live on both sides (caller then can't use input-based discounting).
+
+    CAVEAT: inputs don't fully isolate driver vs tune - a better LINE or timing can give
+    the same inputs yet a faster lap - so A/B/A stays the tiebreaker, just used far less
+    often (only when the inputs look the SAME but the result moved)."""
+    if not (cand.inputs_live and ref.inputs_live) or len(cand.throttle) != len(ref.throttle):
+        return -1.0
+    n = len(cand.throttle)
+    tot, used = 0.0, 0
+    for b in range(n):
+        # only compare bins that actually carry driving on both laps
+        if cand.throttle[b] + cand.brake[b] + ref.throttle[b] + ref.brake[b] <= 0.0:
+            continue
+        d = (abs(cand.throttle[b] - ref.throttle[b])
+             + abs(cand.brake[b] - ref.brake[b])
+             + abs(cand.steer_in[b] - ref.steer_in[b])) / 3.0
+        tot += d
+        used += 1
+    return tot / used if used else -1.0
 
 
 # lever group -> the telemetry channel it primarily targets (TARGETED check)
 _GROUP_CHANNEL = {
     "diff": "exit", "damping_bump": "exit", "damping": "exit", "gearing": "exit",
     "arb": "grip", "springs": "grip", "camber": "grip", "camber_search": "grip",
-    "aero": "grip", "ride_height": "grip", "pressure": "grip",
+    "spring_balance": "grip", "aero": "grip", "ride_height": "grip", "pressure": "grip",
 }
 
 

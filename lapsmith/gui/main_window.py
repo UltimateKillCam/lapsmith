@@ -71,6 +71,24 @@ final check, then stops. Set it to <b>0</b> for Unlimited / off. Editable in <b>
 (minutes)</b> (applies live, even mid-run) and in the setup form — they share one value. The overlay shows
 the time remaining; the saved status reads <i>"converged"</i> or <i>"stopped: time budget"</i> accordingly.</li>
 </ul>
+<h3>Knowing if it's getting anywhere (progress)</h3>
+<p>The overlay always shows a progress line — <i>"Confirmed gains: 3 · Best so far: 51.86 (-0.9s vs start)"</i>
+— plus a plain-language trend: <b>Improving</b>, <b>Fine-tuning</b>, or <b>Not finding much — may finish
+soon</b>. If it stops making progress it says so honestly rather than grinding in silence, and (with a time
+budget) finishes. It also shows how many re-test laps it saved using your inputs (below).</p>
+<h3>Why each change — and using your inputs to cut re-tests</h3>
+<p>Every proposed change shows a one-line <b>why</b> tied to the actual telemetry that triggered it (e.g.
+<i>"On-power oversteer: rear slip 0.45 under throttle"</i>) — never a generic template.</p>
+<p>To tell a real tune gain from you simply driving better, LapSmith now reads your <b>inputs</b> (throttle,
+brake, steering) binned by track position. When a lap looks faster but your inputs changed a lot, it credits
+<i>you</i>, not the tune, and moves on — <b>without</b> a full re-test. It only falls back to the slower
+A/B/A re-drive when your inputs look the <i>same</i> but the result moved (the genuinely ambiguous case), so
+there's far less repetition. (Inputs don't fully isolate driver from tune — a better line can be faster on
+the same inputs — so A/B/A stays the tiebreaker, just used much less often.)</p>
+<h3>Rejecting a change you don't want</h3>
+<p>If you don't want a suggested change, press <b>[F10]</b> (or it's offered on the overlay). It won't be
+applied, and that lever is <b>locked for the rest of the session</b> — it'll never be suggested again, and
+the loop moves on to other changes and can still converge. Every rejection is written to the session log.</p>
 <h3>Reading the overlay — two kinds of state</h3>
 <p>Every overlay state is one of two clearly different colours so a timed lap can never be mistaken for a
 go-to-the-menu prompt:</p>
@@ -88,7 +106,8 @@ everything was already reverted it says <i>"Car is already on the baseline — j
 <table>
 <tr><td><b>F8</b></td><td>advance / confirm / apply</td></tr>
 <tr><td><b>F11</b></td><td>end manual test</td></tr>
-<tr><td><b>F9 / F10</b></td><td>manual segment start / end (free-roam, no lap timer)</td></tr>
+<tr><td><b>F10</b></td><td>reject the shown change (auto-lap) · mark segment END (manual free-roam)</td></tr>
+<tr><td><b>F9</b></td><td>manual segment start (free-roam, no lap timer)</td></tr>
 <tr><td><b>F6</b></td><td>simple / advanced overlay view</td></tr>
 <tr><td><b>F7</b></td><td>switch tab</td></tr>
 <tr><td><b>Ctrl+F12</b></td><td>quit</td></tr>
@@ -96,6 +115,22 @@ everything was already reverted it says <i>"Car is already on the baseline — j
 <h3>Tyre temps</h3>
 <p>Read locally on your PC, fully offline. If a lap's Heat page can't be read, camber is tuned by lap time
 instead, so it never blocks.</p>
+<h3>Console / Xbox (telemetry over the LAN)</h3>
+<p>LapSmith runs on a <b>Windows PC</b>, not on the console. If you play Forza on an Xbox/console, it can
+stream its Data Out telemetry across your home network to the PC running LapSmith — the tuning is the same,
+with one caveat below. Turn on <b>Console mode</b> (setup form, or <b>Settings → Console mode</b>), then on
+the console set Forza's <b>Data Out</b> to:</p>
+<ul>
+<li><b>IP address</b> — your PC's LAN IP (LapSmith shows it when Console mode is on)</li>
+<li><b>Port</b> — the same port as LapSmith (default 5607)</li>
+<li><b>Format: Dash</b> (the layout that includes tyre temps)</li>
+</ul>
+<p>Both devices must be on the same network, and Windows Firewall must allow LapSmith to receive UDP on that
+port (accept the prompt). In Console mode LapSmith listens on all interfaces; on PC it stays on loopback.</p>
+<p><b>The one caveat — camber/toe accuracy.</b> There's no in-game Heat screen to screenshot on a console, so
+tyre temps fall back to the <b>single</b> per-corner temperature in the UDP packet. That's fine for pressure
+and everything else, but <b>camber and toe are less accurate</b> and tuned by lap time instead. A clear
+notice shows on the overlay while Console mode is on.</p>
 <h3>Car names</h3>
 <p>Telemetry only gives a numeric car ID. LapSmith asks you to name a car the first time it sees one, and you
 can bulk-import the community ID→name list under <b>Settings → Import car names</b> (from the Nexus "Forza
@@ -103,6 +138,8 @@ Horizon 6 Car ID List" by xEDWARDSZz). Your own names always win.</p>
 <h3>Settings worth knowing</h3>
 <ul>
 <li><b>Telemetry port</b> — must match the game's Data Out port; applies on next start.</li>
+<li><b>Drivetrain</b> (setup) — leave on Auto-detect unless it's wrong; forcing FWD/RWD/AWD makes the
+differential suggestions match the car (FWD = front diff only, never rear/centre).</li>
 <li><b>Tyre-temp reader</b> — leave on auto.</li>
 <li><b>Cloud reader</b> — off by default; only used if you opt in and set a key.</li>
 <li><b>Overlay default view</b> — simple or advanced.</li>
@@ -172,6 +209,18 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             self.tabs.currentChanged.connect(lambda *_: self.refresh())
 
             self.refresh()
+
+        def closeEvent(self, event):
+            """Closing the window EXITS the app cleanly (saves the in-progress session,
+            flushes its log, releases the UDP port) instead of lingering in the tray -
+            users expect the X to actually close it, and a lingering process is exactly
+            what loses sessions and blocks the port on the next launch."""
+            if not getattr(self, "_quitting", False):
+                self._quitting = True
+                q = self.hooks.get("quit")
+                if q:
+                    q()
+            event.accept()
 
         # ----- card / chip helpers --------------------------------------
         def _wrap_card(self, inner_layout):
@@ -376,10 +425,11 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             intro.setWordWrap(True)
             lay.addWidget(intro)
             for label, fn in (("Write support bundle (zip)", self._write_bundle),
+                              ("Save current session now", self._save_now),
                               ("Export cumulative tune log", self._export_cumulative),
-                              ("Open tunes folder", lambda: _open_path(self._tunes_dir())),
+                              ("Open tunes / logs folder", lambda: _open_path(self._tunes_dir())),
                               ("Open captures folder", lambda: _open_path(self._captures_dir())),
-                              ("Open log file", self._open_app_log)):
+                              ("Open app log file", self._open_app_log)):
                 b = QtWidgets.QPushButton(label)
                 b.setMinimumHeight(32)
                 b.clicked.connect(fn)
@@ -401,6 +451,14 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             fn = self.hooks.get("support_bundle")
             path = fn() if fn else None
             self.logs_status.setText(f"Support bundle: {path}" if path else "Bundle failed.")
+
+        def _save_now(self):
+            """Force-save the current (possibly in-progress) session to disk now -
+            works mid-session, before any normal completion."""
+            fn = self.hooks.get("save_now")
+            ok = fn() if fn else False
+            self.logs_status.setText("Session saved to the tunes/logs folder."
+                                     if ok else "No active session to save.")
 
         def _export_cumulative(self):
             src = os.path.join(self._tunes_dir(), "cumulative_tune_log.md")
@@ -445,6 +503,23 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
                 "earlier if it converges. Changing this applies to a run already going.")
             self.set_budget.valueChanged.connect(self._set_budget)
             form.addRow("Max tuning time (minutes)", self.set_budget)
+
+            # Console mode: Forza on Xbox/console streaming Data Out over the LAN. Tyre
+            # temps fall back to the single UDP value (camber/toe less accurate).
+            self.set_console = QtWidgets.QCheckBox(
+                "Forza runs on Xbox/console (telemetry over the LAN)")
+            self.set_console.setChecked(bool(getattr(self.ctrl, "console_mode", False)))
+            self.set_console.setToolTip(
+                "Receive telemetry from a console on your network instead of this PC. "
+                "Listens on all interfaces; tyre temps use the single per-corner UDP "
+                "value so camber/toe are less accurate (no in-game Heat screen to read).")
+            self.set_console.toggled.connect(self._set_console)
+            form.addRow("Console mode", self.set_console)
+            self.console_hint = QtWidgets.QLabel()
+            self.console_hint.setWordWrap(True)
+            self.console_hint.setStyleSheet("color:#9aa;font-size:11px")
+            self._refresh_console_hint(self.set_console.isChecked())
+            form.addRow("", self.console_hint)
 
             self.set_temp = QtWidgets.QComboBox()
             self.set_temp.addItems(["auto", "manual"])
@@ -541,6 +616,25 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             from ..state import prefs
             self.ctrl.set_time_budget(float(minutes))
             prefs.set("time_budget_min", float(minutes))
+
+        def _set_console(self, on):
+            """Toggle console mode: rebind the listener live, persist, update the hint."""
+            from ..state import prefs
+            self.ctrl.set_console_mode(bool(on))
+            prefs.set("console_mode", bool(on))
+            self._refresh_console_hint(bool(on))
+
+        def _refresh_console_hint(self, on):
+            if on:
+                ip = self.ctrl.lan_ip()
+                self.console_hint.setText(
+                    f"In Forza on the console, set <b>Data Out</b> IP to <b>{ip}</b>, "
+                    f"port <b>{int(getattr(self.ctrl, 'port', 5607))}</b>, format "
+                    "<b>Dash</b>. Camber/toe are less accurate on console (single tyre "
+                    "temp, no 3-zone Heat reading).")
+            else:
+                self.console_hint.setText(
+                    "Off: telemetry from Forza on this PC (loopback), full 3-zone Heat OCR.")
 
         def _toggle_capture(self, checked):
             """Ticking ON requires confirmation (it can let the overlay obscure the

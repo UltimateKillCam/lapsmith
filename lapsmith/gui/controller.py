@@ -113,6 +113,14 @@ class Controller:
     # multi-lap fitness (single laps are too noisy)
     laps_per_test: object = "adaptive"   # "adaptive" | 1 | 2 | 3
     lap_agg: str = "best"                # "best" (default) | "median"
+    # Console mode: Forza runs on an Xbox/console streaming Data Out over the LAN.
+    # No in-game Heat screen to OCR, so tyre temps fall back to the single per-corner
+    # UDP TireTemp; camber/toe degrade to lap-time tuning (less accurate).
+    console_mode: bool = False
+    # Manual drivetrain override (safety net for a misdetected DrivetrainType): when
+    # set to FWD/RWD/AWD it overrides the telemetry-detected drivetrain everywhere
+    # (which diff fields the rules touch, the baseline checklist).
+    drivetrain_override: Optional[str] = None
     _test_laps: List[float] = field(default_factory=list)
     _best_lap_time: Optional[float] = None
     _best_lap_stats: object = None
@@ -157,6 +165,20 @@ class Controller:
     stop_reason: str = ""              # "converged" | "stopped: time budget (N min)"
     final_verdict: str = ""            # honest result text after the final check
     _on_car: dict = field(default_factory=dict)   # values PHYSICALLY entered in-game now
+    # --- UX/methodology (v0.1.12) ---------------------------------------------
+    _session_start_best: Optional[float] = None    # best lap when the baseline was set
+    _confirmed_gains: int = 0          # changes that really lowered the best lap
+    _recent_outcomes: list = field(default_factory=list)   # last few: gain/revert/discount/reject
+    _rejected_fields: set = field(default_factory=set)      # user-rejected levers (whole session)
+    _aba_saved: int = 0                # A/B/A re-tests SKIPPED thanks to driver-input discounting
+    # The BEST CONFIRMED tune (what gets SAVED) - tracked separately from state.current,
+    # which drifts during reverts/A-B-A. Guarantees the saved tune is never a mid-flight
+    # reverted state (fixes "exited on baseline despite a faster confirmed tune").
+    _best_tune: object = None          # Tune copy that achieved best_segment
+    _best_tune_lap: Optional[float] = None
+    _session_log: object = None        # open file handle: incremental crash-safe log
+    _saved: bool = False               # a final save has been written
+    persist: bool = False              # app sets True; gates disk writes (off in tests)
     # change aggressiveness -> step multiplier (fine 0.5 / normal 1.0 / coarse 2.0).
     aggressiveness: str = "normal"
     stale: int = 0
@@ -187,10 +209,36 @@ class Controller:
     overlay_capturable: bool = False
 
     # ---- lifecycle -------------------------------------------------------
+    def _bind_host(self) -> str:
+        # Console mode: the console streams from another LAN device, so listen on all
+        # interfaces. PC mode stays on loopback (safer; no LAN exposure).
+        return "0.0.0.0" if self.console_mode else "127.0.0.1"
+
     def start(self):
         if self.listener is None:
-            self.listener = TelemetryListener(port=self.port)
+            self.listener = TelemetryListener(port=self.port, host=self._bind_host())
         self.listener.start()
+
+    def set_console_mode(self, on: bool):
+        """Toggle console mode. Rebinds the UDP listener (loopback <-> all interfaces)
+        live so the change takes effect without a restart."""
+        on = bool(on)
+        if on == self.console_mode:
+            return
+        self.console_mode = on
+        want = self._bind_host()
+        if self.listener is not None and getattr(self.listener, "host", None) != want:
+            running = self.listener._running.is_set()
+            self.listener.stop()
+            self.listener = TelemetryListener(port=self.port, host=want)
+            if running:
+                self.listener.start()
+        _laplog.info("CONSOLE MODE %s; UDP listening on %s:%d.",
+                     "ON" if on else "OFF", want, self.port)
+        self.log(f"Console mode {'ON' if on else 'OFF'} - "
+                 + ("listening for LAN telemetry; tyre temps use the single UDP value "
+                    "(camber/toe less accurate)." if on
+                    else "back to PC/loopback with Heat-screen OCR."))
 
     def stop(self):
         if self.listener:
@@ -199,6 +247,43 @@ class Controller:
     def log(self, msg: str):
         self.messages.append(msg)
         self.messages = self.messages[-50:]
+        # INCREMENTAL crash-safe session log: append + flush every line, so a session
+        # is recoverable even if the app crashes / is force-closed before finish().
+        fh = self._session_log
+        if fh is not None:
+            try:
+                fh.write(f"{_dt.datetime.now().isoformat(timespec='seconds')}  {msg}\n")
+                fh.flush()
+            except Exception:
+                self._session_log = None        # never let logging break the session
+
+    def _open_session_log(self):
+        """Open (or reopen) the per-session log the moment a session meaningfully
+        starts. Errors are surfaced, not swallowed - a failed write means lost data."""
+        self._close_session_log()
+        try:
+            m = self._meta()
+            path = store.session_log_path(m["car"], self.discipline or "session")
+            self._session_log = open(path, "a", encoding="utf-8")
+            self._session_log.write(
+                f"\n===== SESSION START {self.started_iso} "
+                f"({m['car']}, {self.discipline}) =====\n")
+            self._session_log.flush()
+            _laplog.info("session log open (incremental): %s", path)
+        except Exception as e:
+            self._session_log = None
+            _laplog.exception("could not open session log")
+            self.fail(f"session log could not be opened ({e}); check the sessions folder "
+                      "is writable - see app.log.")
+
+    def _close_session_log(self):
+        fh, self._session_log = self._session_log, None
+        if fh is not None:
+            try:
+                fh.write("===== SESSION LOG CLOSED =====\n")
+                fh.close()
+            except Exception:
+                pass
 
     # ---- telemetry helpers ----------------------------------------------
     def snapshot(self):
@@ -303,6 +388,15 @@ class Controller:
         self.stop_reason = ""
         self.final_verdict = ""
         self._on_car = {}
+        self._session_start_best = None
+        self._confirmed_gains = 0
+        self._recent_outcomes = []
+        self._rejected_fields = set()
+        self._aba_saved = 0
+        self._best_tune = None
+        self._best_tune_lap = None
+        self._close_session_log()
+        self._saved = False
         self.error = None
         self.started_iso = _dt.datetime.now().isoformat(timespec="seconds")
 
@@ -332,7 +426,15 @@ class Controller:
                     target_class: Optional[str] = None,
                     aggressiveness: Optional[str] = None,
                     rigour: Optional[str] = None,
-                    time_budget_min: Optional[float] = None):
+                    time_budget_min: Optional[float] = None,
+                    console_mode: Optional[bool] = None,
+                    drivetrain: Optional[str] = None):
+        if console_mode is not None:
+            self.set_console_mode(bool(console_mode))   # rebinds the listener if needed
+        if drivetrain in ("FWD", "RWD", "AWD"):
+            self.drivetrain_override = drivetrain
+        elif drivetrain in ("auto", "", None):
+            self.drivetrain_override = None
         self.discipline = discipline
         if aggressiveness in ("fine", "normal", "coarse"):
             self.aggressiveness = aggressiveness
@@ -360,14 +462,30 @@ class Controller:
         self.target_class = (target_class
                              or (self.identity.target_class if self.identity else "S1 800"))
         target = self.target_class
-        drivetrain = self.identity.drivetrain if self.identity else "AWD"
+        drivetrain = self.effective_drivetrain()        # manual override wins
         car = self.identity.name if self.identity else "Car"
         self.baseline = build_baseline(car, target, discipline,
                                        self.front_weight_pct, drivetrain,
                                        limits=self.limits)
         self.state = TuneState(self.baseline.copy())
         self.phase = APPLY_BASELINE
-        self.log(f"Baseline built for {car} ({target}, {drivetrain}).")
+        # best CONFIRMED tune starts as the baseline (no confirmed gain yet)
+        self._best_tune = self.baseline.copy()
+        self._best_tune_lap = None
+        self._saved = False
+        src = ("manual override" if self.drivetrain_override
+               else f"detected raw {self.identity.drivetrain_raw if self.identity else '?'}")
+        _laplog.info("SETUP: drivetrain=%s (%s); discipline=%s; target=%s.",
+                     drivetrain, src, discipline, target)
+        # session meaningfully starts now -> open the incremental log + record a
+        # provisional session row so it shows in history even on an abnormal exit.
+        # (Gated by `persist` so unit tests don't write to disk on every apply_setup.)
+        if self.persist:
+            self._open_session_log()
+            self.log(f"Baseline built for {car} ({target}, {drivetrain}).")
+            self.save_progress("in_progress")
+        else:
+            self.log(f"Baseline built for {car} ({target}, {drivetrain}).")
 
     def baseline_checklist(self) -> str:
         if not self.baseline:
@@ -377,7 +495,7 @@ class Controller:
         return format_checklist(self.baseline, ident.name if ident else "Car",
                                 target,
                                 self.discipline, self.front_weight_pct,
-                                ident.drivetrain if ident else "AWD")
+                                self.effective_drivetrain())
 
     def baseline_applied(self):
         """User entered the baseline. Mode is NOT locked here - it stays
@@ -568,6 +686,85 @@ class Controller:
             return
         self._finalize_test()
 
+    def progress_state(self) -> dict:
+        """A plain-language read on whether the session is getting anywhere: best vs
+        the session start, how many changes really stuck, and the recent trend."""
+        best, start = self.best_segment, self._session_start_best
+        delta = (best - start) if (best is not None and start is not None) else None
+        recent = self._recent_outcomes[-4:]
+        recent_gain = any(o == "gain" for o in recent)
+        dry = len(recent) >= 3 and not recent_gain
+        if best is None:
+            trend = "Getting a baseline"
+        elif self.phase == DONE:
+            trend = "Done"
+        elif self.stale >= 2 or dry:
+            trend = "Not finding much - may finish soon"
+        elif recent_gain and delta is not None and delta < -0.05:
+            trend = "Improving"
+        elif self._confirmed_gains > 0:
+            trend = "Fine-tuning"
+        else:
+            trend = "Searching for gains"
+        return {"confirmed_gains": self._confirmed_gains, "best_s": best,
+                "start_s": start, "delta_vs_start_s": delta, "trend": trend,
+                "aba_saved": self._aba_saved}
+
+    def reject_change(self):
+        """User rejects the proposed change ([F10]/overlay): DON'T apply it, LOCK those
+        levers for the rest of the session (never propose them again), and move on. A
+        rejected lever is treated like a locked one, so it can't block convergence."""
+        if self.phase != SHOW_CHANGE or not self.batch:
+            return
+        grp = self.batch[0].group
+        if grp in ("confirm_revert", "confirm_reapply", "final_baseline", "reanchor"):
+            self.log("[reject] this step is a measurement, not a tuning change - nothing to reject.")
+            return
+        fields = []
+        for rec in self.batch:
+            for fld in rec.fields:
+                self._rejected_fields.add(fld)
+                fields.append(fld)
+        labels = ", ".join(field_label(f) for f in fields)
+        _laplog.info("REJECT: user rejected %s -> fields %s LOCKED for the session.",
+                     [(r.group, r.fields) for r in self.batch], fields)
+        self.log(f"[reject] Skipped {labels} - won't suggest that again this session.")
+        self._record_outcome("reject")
+        self.batch = []
+        self._applied_records = []
+        self._compute_batch()
+        if self.phase == DONE and self._telemetry_mode and not self._final_check_done:
+            self._begin_final_check(reason="converged")
+
+    def effective_drivetrain(self) -> str:
+        """Drivetrain the rules should tune for: the manual override if set, else the
+        telemetry-detected one. Source is logged so a misdetect is obvious in the log."""
+        if self.drivetrain_override in ("FWD", "RWD", "AWD"):
+            return self.drivetrain_override
+        return self.identity.drivetrain if self.identity else "AWD"
+
+    CONSOLE_NOTICE = ("Console mode: only ONE tyre temperature per corner is available "
+                      "(no in-game Heat screen to read the 3-zone inner/middle/outer "
+                      "temps). Camber and toe suggestions are LESS ACCURATE and tuned by "
+                      "lap time instead. Everything else works normally.")
+
+    def lan_ip(self) -> str:
+        """Best-guess LAN IP of this PC (what to enter as the Data Out target on the
+        console). No packets are sent - the connect() just picks the outbound NIC."""
+        import socket as _s
+        try:
+            sk = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+            try:
+                sk.connect(("8.8.8.8", 80))     # no traffic; selects the default route
+                return sk.getsockname()[0]
+            finally:
+                sk.close()
+        except OSError:
+            try:
+                return _s.gethostbyname(_s.gethostname())
+            except OSError:
+                return "127.0.0.1"
+
     def budget_remaining_s(self) -> Optional[float]:
         """Seconds left on the wall-clock budget (None if unlimited or not started)."""
         if self.time_budget_min <= 0 or self._budget_start == 0.0:
@@ -648,19 +845,35 @@ class Controller:
                                "final check, then press F8.", "checklist": []}
             headers = {
                 "final_baseline": "CHANGE THESE NOW - set the car back to the baseline",
-                "confirm_revert": "CHANGE THESE NOW - revert to the previous tune",
-                "confirm_reapply": "CHANGE THESE NOW - re-apply the confirmed change",
+                "confirm_revert": "DOUBLE-CHECK - re-drive the PREVIOUS setup",
+                "confirm_reapply": "CONFIRMED REAL - re-apply the change",
             }
+            subs = {
+                "confirm_revert": "Double-checking that last change was really the tune, not "
+                                  "you driving better - enter the PREVIOUS values, then F8.",
+                "confirm_reapply": "It beat the re-driven baseline - a real gain. Re-enter "
+                                   "these values, then F8.",
+                "final_baseline": "Re-enter the original baseline values, then F8.",
+            }
+            # one-line, telemetry-tied WHY per proposed change (e.g. "On-power oversteer:
+            # rear slip ratio 0.45 under throttle (> 0.3)").
+            normal = grp not in ("final_baseline", "confirm_revert", "confirm_reapply")
+            why = [r.reason for r in self.batch if getattr(r, "reason", "")] if normal else []
             return {"klass": "action", "action": grp or "change",
                     "header": headers.get(grp, "CHANGE THESE NOW"),
-                    "sub": "Set each value below, then press F8 when applied.",
+                    "sub": subs.get(grp, "Set each value below, then press F8 when applied."),
+                    "why": why if normal else [],
+                    "can_reject": normal,
                     "checklist": cl}
         if ph == DRIVE_AUTO:
             if self.mode is None:
                 return {"klass": "drive", "header": "DETECTING - drive a lap",
                         "sub": "Auto-lap engages when the lap timer advances.", "checklist": []}
             skip = self._skip_laps
-            if self._reanchor_pending:
+            if self._aba is not None:
+                hdr = ("DOUBLE-CHECK out-lap - get back to the line" if skip > 0
+                       else "DOUBLE-CHECKING - re-drive the PREVIOUS setup (was it the tune, not you?)")
+            elif self._reanchor_pending:
                 hdr = ("RE-ANCHOR out-lap - get back to the line" if skip > 0
                        else "RE-ANCHOR - drive the current tune (no changes)")
             elif self._final_check:
@@ -726,6 +939,7 @@ class Controller:
         if not was_awaiting and self.best_segment is None:    # the first baseline anchor (after warm-up)
             self.best_segment = test_time
             self._baseline_lap_s = test_time
+            self._session_start_best = test_time          # progress baseline (best-vs-start)
             self._ref_telem = cand
             self._baseline_telem = cand
             self.log(f"[baseline] reference {test_time:.2f}s set "
@@ -811,8 +1025,16 @@ class Controller:
                              f"({delta:+.2f}s) - locked; moving to other levers.")
         self._cur_bottoming_axles = set()
 
+    def _record_outcome(self, kind: str):
+        """Track recent keep/revert/discount/reject outcomes for the progress state."""
+        if kind == "gain":
+            self._confirmed_gains += 1
+        self._recent_outcomes.append(kind)
+        self._recent_outcomes = self._recent_outcomes[-6:]
+
     def _keep_batch(self, test_time, cand=None):
         """Bank the applied batch as a real gain."""
+        improved = self.best_segment is None or test_time < self.best_segment - 1e-9
         for r in self._applied_records:
             r.verdict = "kept"
         self.best_segment = test_time if self.best_segment is None else min(self.best_segment, test_time)
@@ -822,6 +1044,10 @@ class Controller:
         for key, fld, _prev in self._batch_lever_keys():
             self._noimprove[key] = 0
             self._last_improving[fld] = self.state.current.get(fld)
+        if improved:                       # snapshot the BEST CONFIRMED tune for saving
+            self._best_tune = self.state.current.copy()
+            self._best_tune_lap = self.best_segment
+        self._record_outcome("gain" if improved else "flat")
 
     def _revert_batch(self):
         for r in reversed(self._applied_records):
@@ -858,13 +1084,39 @@ class Controller:
             self.stale += 1
             self._count_and_lock(keys, lap_delta)
             self._lock_bottoming_if_no_improve(False, lap_delta)
+            self._record_outcome("revert")
             self._applied_records = []
             self.state.iteration += 1
             self._next_step()
             return
 
         if apparent_win:
+            # DRIVER-INPUT DISCOUNTING: if the human drove notably differently this lap
+            # (throttle/brake/steering changed), the apparent gain is likely the DRIVER,
+            # not the tune - so DISCOUNT it WITHOUT a full A/B/A re-test. Only fall back
+            # to A/B/A when the inputs look the SAME but the result moved (inconclusive).
+            in_delta = fitness.input_difference(cand, ref)
+            if 0.0 <= in_delta and in_delta > fitness.INPUT_DRIVER_THRESH:
+                self._aba_saved += 1
+                _laplog.info("INPUT-DISCOUNT: apparent gain but driver inputs differ a lot "
+                             "(%.3f > %.3f) - crediting the DRIVER, not the tune; A/B/A skipped.",
+                             in_delta, fitness.INPUT_DRIVER_THRESH)
+                self.log("[fitness] that looked faster, but your inputs changed a lot this lap - "
+                         "scoring it as YOU driving differently, not the tune (saved a re-test lap).")
+                self._revert_batch()
+                self.stale += 1
+                self._count_and_lock(keys, lap_delta)
+                self._lock_bottoming_if_no_improve(False, lap_delta)
+                self._record_outcome("discount")
+                self._applied_records = []
+                self.state.iteration += 1
+                self._next_step()
+                return
             if self.rigour == "confirmed":
+                if in_delta >= 0.0:
+                    _laplog.info("INPUT-CHECK: inputs similar (%.3f <= %.3f) but the result "
+                                 "moved - INCONCLUSIVE; running A/B/A to be sure.",
+                                 in_delta, fitness.INPUT_DRIVER_THRESH)
                 self._start_aba(test_time, cand, comp)   # drives its own A' measurement
                 return
             # quick rigour: single-pass accept
@@ -883,6 +1135,7 @@ class Controller:
                  f"{fitness.COMPOSITE_IMPROVE_EPS:.3f} (no telemetry gain); reverted.")
         self._count_and_lock(keys, lap_delta)
         self._lock_bottoming_if_no_improve(False, lap_delta)
+        self._record_outcome("revert")
         self._applied_records = []
         self.state.iteration += 1
         self._next_step()
@@ -922,6 +1175,18 @@ class Controller:
             for r in aba["records"]:
                 b_fields.update(r.fields)
             self._aba_keep = {"b_telem": aba["b_telem"], "b_time": aba["b_time"]}
+            # COMMIT B to the best-confirmed tune NOW (it beat the re-measured baseline),
+            # so even if the session ends before the user re-applies it, the confirmed
+            # gain isn't lost (fixes "exited on baseline despite a faster tune").
+            bt = self.state.current.copy()
+            for fld, val in b_fields.items():
+                bt.set(fld, val)
+            self._best_tune = bt
+            self._best_tune_lap = aba["b_time"]
+            if self.best_segment is None or aba["b_time"] < self.best_segment:
+                self.best_segment = aba["b_time"]
+            if self.persist:
+                self.save_progress("in_progress")     # persist the confirmed gain immediately
             rec = rules.Recommendation(
                 "confirm_reapply", dict(b_fields),
                 "A/B/A CONFIRMED: the change still beats the re-measured baseline - a real "
@@ -942,6 +1207,7 @@ class Controller:
                          "kept A and re-anchored to A' %.2f.", comp.delta, aprime_time)
             self.log("[A/B/A] The gain was driver improvement, not the tune - DISCARDED; kept the "
                      "previous tune and re-anchored to your current pace.")
+            self._record_outcome("discount")
             self._next_step()
 
     def _begin_reanchor(self):
@@ -1177,6 +1443,14 @@ class Controller:
         self.state.iteration += 1
 
     def _read_lap_heat(self):
+        # Console mode: no in-game Heat screen to screenshot/OCR. Skip it entirely and
+        # use the single per-corner UDP TireTemp (already aggregated into stats for the
+        # pressure L/R balance). tyre_reading=None makes camber/toe degrade to lap-time
+        # tuning - we never fabricate a 3-zone reading we don't have.
+        if self.console_mode:
+            self.tyre_reading = None
+            self.last_reader = "console (single UDP temp)"
+            return
         path, g, udp = (self.lap_heat_fn() if self.lap_heat_fn else (None, 0.0, None))
         self._read_heat(path, g, udp_temps=udp)
 
@@ -1362,6 +1636,17 @@ class Controller:
     def _compute_batch(self):
         """Build the change(s) for this test lap: all evidence-driven changes
         together + up to `changes_per_test` search-driven steps."""
+        # The diff rule is drivetrain-aware (FWD front-only, RWD rear-only, AWD
+        # centre+rear). Force the effective drivetrain (manual override wins over the
+        # telemetry-detected one) onto the stats the rules read, so a misdetected
+        # DrivetrainType can't hand a FWD car rear/centre-diff inputs.
+        if self.stats is not None:
+            eff = self.effective_drivetrain()
+            if eff != getattr(self.stats, "drivetrain", None):
+                _laplog.info("DRIVETRAIN: tuning as %s (override=%s, detected=%s).", eff,
+                             self.drivetrain_override or "none",
+                             self.identity.drivetrain if self.identity else "?")
+            self.stats.drivetrain = eff
         self.batch = rules.analyze_batch(
             self.stats, self.state.current, self.discipline, self.tyre_reading,
             converged=self.state.converged_levers, limits=self.limits,
@@ -1369,7 +1654,8 @@ class Controller:
             bottoming_locked=self._bottoming_locked,
             step_mult=rules.step_mult_for(self.aggressiveness),
             bottoming_attempts=self._bottoming_attempts,
-            lever_locked=self._lever_locked)
+            lever_locked=self._lever_locked,
+            rejected_fields=self._rejected_fields)
         if not self.batch:
             if self.stale >= 2 or self.best_segment is None:
                 self.phase = DONE
@@ -1413,12 +1699,16 @@ class Controller:
             if keep.get("b_telem") is not None and getattr(keep["b_telem"], "live", False):
                 self._ref_telem = keep["b_telem"]
             bt = keep.get("b_time")
+            improved = bt is not None and (self.best_segment is None or bt <= self.best_segment + 1e-9)
             if bt is not None and (self.best_segment is None or bt < self.best_segment):
                 self.best_segment = bt
+            self._best_tune = self.state.current.copy()    # B is now physically applied
+            self._best_tune_lap = bt if bt is not None else self._best_tune_lap
             self.stale = 0
             self.batch = []
             self._applied_records = []
             self.state.iteration += 1
+            self._record_outcome("gain" if improved else "flat")
             self.log("[A/B/A] confirmed change re-applied and kept; continuing.")
             self._next_step()
             return
@@ -1455,35 +1745,84 @@ class Controller:
                               or (ident.target_class if ident else "S1 800")),
                 "drivetrain": ident.drivetrain if ident else "AWD"}
 
+    def save_on_exit(self):
+        """Called from the shutdown path (window close / tray Quit / atexit). If a
+        session is in progress and not already finalised, persist the best confirmed
+        tune so an abnormal exit never loses it, then flush+close the session log."""
+        try:
+            if self.state and self.baseline and not self._saved and self.phase != DONE:
+                self.log("Session ended early - saving the best confirmed tune so far.")
+                self.save_progress("interrupted")
+        except Exception:
+            _laplog.exception("save_on_exit failed")
+        finally:
+            self._close_session_log()
+
+    def best_confirmed_tune(self):
+        """The tune that is actually SAVED: the best CONFIRMED one (never a mid-flight
+        reverted state.current). Falls back to the baseline if nothing was confirmed."""
+        if self._best_tune is not None:
+            return self._best_tune
+        return self.baseline.copy() if self.baseline else (self.state.current if self.state else None)
+
+    def save_progress(self, status: str) -> bool:
+        """Write the session JSON + shareable tune for the BEST CONFIRMED tune. Safe to
+        call ANY time (after baseline, on convergence/budget, or on an abnormal exit) so
+        a session is never lost. Returns True on success; surfaces write errors."""
+        if not self.state or not self.baseline:
+            return False
+        m = self._meta()
+        out = self.best_confirmed_tune()
+        improved = (self._best_tune_lap is not None and self._baseline_lap_s is not None
+                    and self._best_tune_lap < self._baseline_lap_s - 1e-6)
+        best_lap = self._best_tune_lap if improved else (self._baseline_lap_s or self.best_segment)
+        try:
+            store.save_session(
+                self.state, car=m["car"], car_class=m["car_class"], discipline=self.discipline,
+                front_weight_pct=self.front_weight_pct, drivetrain=m["drivetrain"],
+                baseline=self.baseline, stats_log=[], started_iso=self.started_iso,
+                status=status, limits=self.limits, best_lap_s=best_lap,
+                finished_iso=_dt.datetime.now().isoformat(timespec="seconds"),
+                final_tune=out)
+            self.export = store.export_tune(
+                self.state, car=m["car"], car_class=m["car_class"], discipline=self.discipline,
+                front_weight_pct=self.front_weight_pct, drivetrain=m["drivetrain"],
+                best_lap_s=best_lap, final_tune=out)
+            try:
+                store.append_cumulative_log(
+                    self.state, self.baseline, car=m["car"], car_class=m["car_class"],
+                    discipline=self.discipline, drivetrain=m["drivetrain"],
+                    started_iso=self.started_iso, best_lap_s=best_lap,
+                    baseline_lap_s=self._baseline_lap_s)
+            except Exception:
+                _laplog.exception("cumulative log append failed")
+            return True
+        except Exception as e:
+            _laplog.exception("save_progress(%s) FAILED", status)
+            self.fail(f"could not save the session ({e}); see app.log - the sessions "
+                      "folder may be unwritable.")
+            return False
+
     def finish(self):
         if not self.state:
             return
-        m = self._meta()
-        finished_iso = _dt.datetime.now().isoformat(timespec="seconds")
-        store.save_session(self.state, car=m["car"], car_class=m["car_class"],
-                           discipline=self.discipline, front_weight_pct=self.front_weight_pct,
-                           drivetrain=m["drivetrain"], baseline=self.baseline, stats_log=[],
-                           started_iso=self.started_iso,
-                           status=(self.stop_reason or "converged"),
-                           limits=self.limits, best_lap_s=self.best_segment,
-                           finished_iso=finished_iso)
         if self.final_verdict:
             self.log(self.final_verdict)
-        # shareable value sheet (.txt + optn block) + clean JSON, in the known folder
-        self.export = store.export_tune(
-            self.state, car=m["car"], car_class=m["car_class"], discipline=self.discipline,
-            front_weight_pct=self.front_weight_pct, drivetrain=m["drivetrain"],
-            best_lap_s=self.best_segment)
-        # cumulative log (paste into an LLM to refine the method)
-        try:
-            store.append_cumulative_log(
-                self.state, self.baseline, car=m["car"], car_class=m["car_class"],
-                discipline=self.discipline, drivetrain=m["drivetrain"],
-                started_iso=self.started_iso, best_lap_s=self.best_segment,
-                baseline_lap_s=self._baseline_lap_s)
-        except Exception:
-            _laplog.exception("cumulative log append failed")
-        self.log(f"Tune saved. Shareable files in {self.export['folder']}.")
+        # state which tune was chosen and WHY (best confirmed vs baseline)
+        improved = (self._best_tune_lap is not None and self._baseline_lap_s is not None
+                    and self._best_tune_lap < self._baseline_lap_s - 1e-6)
+        if improved:
+            self.log(f"Final tune = BEST CONFIRMED ({self._best_tune_lap:.2f}s, "
+                     f"{self._confirmed_gains} confirmed change(s) vs baseline "
+                     f"{self._baseline_lap_s:.2f}s).")
+        else:
+            self.log("Final tune = the original baseline (no change beat it once driver "
+                     "improvement was accounted for).")
+        ok = self.save_progress(self.stop_reason or "converged")
+        if ok:
+            self._saved = True             # finalised - save_on_exit won't re-save
+            self.log(f"Tune saved. Shareable files in {self.export['folder']}.")
+        self._close_session_log()
         self.phase = DONE
 
     def env_info(self) -> dict:
@@ -1713,6 +2052,10 @@ class Controller:
             "iteration": self.state.iteration if self.state else 0,
             "best_segment_s": self.best_segment,
             "ui": self.ui_state(),
+            "progress": self.progress_state(),
+            "console_mode": self.console_mode,
+            "console_notice": self.CONSOLE_NOTICE if self.console_mode else None,
+            "lan_ip": self.lan_ip() if self.console_mode else None,
             "budget_min": self.time_budget_min or None,
             "budget_remaining_s": self.budget_remaining_s(),
             "budget_expired": self._budget_expired,

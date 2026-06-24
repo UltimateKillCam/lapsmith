@@ -22,7 +22,10 @@ def _val(spin) -> Optional[float]:
 
 def show_setup_dialog(detected_summary: str = "",
                       detected_class: str = "",
-                      time_budget_default: float = 20.0) -> Optional[dict]:
+                      time_budget_default: float = 20.0,
+                      console_default: bool = False,
+                      lan_ip: str = "",
+                      detected_drivetrain: str = "") -> Optional[dict]:
     try:
         from PySide6 import QtWidgets
     except Exception as e:  # pragma: no cover
@@ -67,6 +70,18 @@ def show_setup_dialog(detected_summary: str = "",
     disc = QtWidgets.QComboBox()
     disc.addItems(_DISCIPLINES)
     form.addRow("Discipline", disc)
+
+    # Drivetrain override (safety net for a misdetected DrivetrainType). Default
+    # Auto-detect uses the telemetry value; FWD/RWD/AWD force it so the diff rules
+    # only ever touch a diff the car actually has.
+    dt = QtWidgets.QComboBox()
+    _auto_label = f"Auto-detect ({detected_drivetrain})" if detected_drivetrain else "Auto-detect"
+    dt.addItems([_auto_label, "FWD", "RWD", "AWD"])
+    dt.setToolTip(
+        "Leave on Auto-detect unless the detected drivetrain is wrong. Forcing it "
+        "makes the differential suggestions match the car: FWD = front diff only, "
+        "RWD = rear only, AWD = centre + rear (never rear/centre inputs on a FWD car).")
+    form.addRow("Drivetrain", dt)
 
     fw = QtWidgets.QDoubleSpinBox()
     fw.setRange(0, 100)
@@ -119,6 +134,24 @@ def show_setup_dialog(detected_summary: str = "",
         "Set to 0 for Unlimited / off.")
     form.addRow("Tuning time budget", budget)
 
+    console = QtWidgets.QCheckBox("Forza runs on Xbox/console (telemetry over the LAN)")
+    console.setChecked(bool(console_default))
+    console.setToolTip(
+        "Turn on if Forza is running on a console and streaming Data Out to this PC over "
+        "your network. The tuning works the same, EXCEPT tyre temps come from the single "
+        "per-corner UDP value (there's no in-game Heat screen to read), so camber and toe "
+        "are less accurate and tuned by lap time.")
+    form.addRow("Console mode", console)
+    _ip = lan_ip or "this PC's LAN IP"
+    console_note = _wrapped(
+        f"<i>Console mode: in Forza on the console, set <b>Data Out</b> IP to "
+        f"<b>{_ip}</b> and port to the value above, format <b>Dash</b>. Tyre temps then "
+        "use the single UDP value - camber/toe are <b>less accurate</b> (no 3-zone Heat "
+        "reading).</i>")
+    console_note.setVisible(bool(console_default))
+    console.toggled.connect(console_note.setVisible)
+    form.addRow("", console_note)
+
     tmode = QtWidgets.QComboBox()
     tmode.addItems(["Auto, local OCR (rec.)", "Manual entry each lap"])
     form.addRow("Tyre temps", tmode)
@@ -133,7 +166,7 @@ def show_setup_dialog(detected_summary: str = "",
 
     # Let the combos shrink instead of dictating the dialog width by their longest
     # item: size to a modest content length (the popup still shows full text).
-    for c in (target, disc, cpt, lpt, agg, aggro, rigour, tmode):
+    for c in (target, disc, dt, cpt, lpt, agg, aggro, rigour, tmode):
         c.setSizeAdjustPolicy(
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         c.setMinimumContentsLength(22)
@@ -210,4 +243,6 @@ def show_setup_dialog(detected_summary: str = "",
             "aggressiveness": ("fine", "normal", "coarse")[aggro.currentIndex()],
             "rigour": "quick" if rigour.currentIndex() == 1 else "confirmed",
             "time_budget_min": float(budget.value()),   # 0 = unlimited
+            "console_mode": bool(console.isChecked()),
+            "drivetrain": ("auto", "FWD", "RWD", "AWD")[dt.currentIndex()],
             "use_vision_api": bool(vapi.isChecked())}

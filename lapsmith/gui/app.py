@@ -106,8 +106,9 @@ class PeakHeatCapture:
     Runs continuously; `reset_and_get()` returns the best frame since the last
     reset and starts a fresh one (used per-lap in auto mode). The app's overlay is
     excluded from captures (WDA_EXCLUDEFROMCAPTURE) so frames are game-only."""
-    def __init__(self, listener, tag: int = 0):
+    def __init__(self, listener, tag: int = 0, console_fn=None):
         self.listener, self.tag = listener, tag
+        self.console_fn = console_fn       # () -> bool; console mode skips screenshots
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self.best_g = 0.0
@@ -128,6 +129,11 @@ class PeakHeatCapture:
         prev_speed = None
         while not self._stop.is_set():
             try:
+                # Console mode: no in-game Heat page to screenshot - skip OCR capture
+                # entirely (the controller uses the single UDP TireTemp instead).
+                if self.console_fn and self.console_fn():
+                    time.sleep(0.25)
+                    continue
                 s = self.listener.snapshot() if self.listener else None
                 if s is not None:
                     g = lateral_g(s)                       # LATERAL only, not launch
@@ -224,8 +230,18 @@ def main(argv=None) -> int:
     ctrl = C.Controller(port=args.port,
                         started_iso=_dt.datetime.now().isoformat(timespec="seconds"))
     ctrl.time_budget_min = prefs.time_budget_min()   # persisted ceiling (default 20)
-    ctrl.start()
-    ctrl.log(f"Listening on 127.0.0.1:{args.port}. Enable Data Out + borderless windowed.")
+    ctrl.console_mode = bool(prefs.get("console_mode", False))   # binds 0.0.0.0 if on
+    ctrl.persist = True                              # enable disk writes (logs/history)
+    try:
+        ctrl.start()
+        ctrl.log(f"Listening on 127.0.0.1:{args.port}. Enable Data Out + borderless windowed.")
+    except OSError as e:
+        # Port already bound (usually a stale LapSmith that didn't exit cleanly). Don't
+        # fail silently - tell the user exactly what's wrong and how to fix it.
+        log.exception("UDP bind failed on port %s", args.port)
+        ctrl.fail(f"Telemetry port {args.port} is already in use - another LapSmith may "
+                  "still be running. Quit it (Task Manager: LapSmith.exe) or change the "
+                  f"port in Settings, then reopen. ({e})")
     ctrl.log(f"Log file: {logfile}")
 
     # build overlay (raises a helpful RuntimeError if PySide6 is missing).
@@ -318,14 +334,23 @@ def main(argv=None) -> int:
                     log.exception("capture stop failed")
                 box["cap"] = None
         try:
+            ctrl.save_on_exit()    # persist an in-progress session + flush the session log
+        except Exception:
+            log.exception("save_on_exit failed")
+        try:
             ctrl.stop()        # closes the UDP socket -> frees port 5607 now
         except Exception:
             log.exception("controller stop failed")
 
     def real_quit():
-        log.info("tray Quit - exiting")
-        _shutdown()            # release UDP 5607 NOW, before the loop unwinds
+        log.info("clean quit - exiting")
+        _shutdown()            # save session + release UDP 5607 NOW, before unwinding
         app.quit()
+
+    # belt-and-suspenders: run the same clean shutdown even on an unexpected exit, so
+    # the UDP socket is freed and an in-progress session is saved no matter what.
+    import atexit
+    atexit.register(_shutdown)
 
     # forward declaration so hooks can reference start_tuning before it's defined
     state = {"start_tuning": None}
@@ -339,6 +364,7 @@ def main(argv=None) -> int:
         # re-apply the overlay's capture display-affinity when the Settings
         # checkbox changes, so it takes effect immediately on the live overlay.
         "apply_overlay_capture": lambda: overlay.apply_capture_affinity(),
+        "save_now": lambda: ctrl.save_progress("in_progress") if ctrl.state else False,
         "quit": real_quit,
     }
     window = main_window.build_main_window(ctrl, hooks)
@@ -421,13 +447,19 @@ def main(argv=None) -> int:
             ctrl.confirm_car()                         # prompts for a name if unknown
             res = setup_form.show_setup_dialog(ctrl.identity.summary(),
                                                ctrl.identity.class_letter,
-                                               time_budget_default=prefs.time_budget_min())
+                                               time_budget_default=prefs.time_budget_min(),
+                                               console_default=bool(prefs.get("console_mode", False)),
+                                               lan_ip=ctrl.lan_ip(),
+                                               detected_drivetrain=(ctrl.identity.drivetrain
+                                                                    if ctrl.identity else ""))
             if not res:
                 ctrl.log("Setup cancelled.")
                 ctrl.phase = C.WAIT_TELEMETRY
                 return
             if res.get("time_budget_min") is not None:    # share with the main-window control
                 prefs.set("time_budget_min", float(res["time_budget_min"]))
+            if res.get("console_mode") is not None:        # share with the main-window toggle
+                prefs.set("console_mode", bool(res["console_mode"]))
             ctrl.apply_setup(res["discipline"], res["limits"], res["front_weight"],
                              changes_per_test=res["changes_per_test"],
                              laps_per_test=res["laps_per_test"], lap_agg=res["lap_agg"],
@@ -436,7 +468,9 @@ def main(argv=None) -> int:
                              target_class=res.get("target_class"),
                              aggressiveness=res.get("aggressiveness"),
                              rigour=res.get("rigour"),
-                             time_budget_min=res.get("time_budget_min"))
+                             time_budget_min=res.get("time_budget_min"),
+                             console_mode=res.get("console_mode"),
+                             drivetrain=res.get("drivetrain"))
             done_box["bundled"] = False
             log.info("setup applied: %s -> phase=%s",
                      {k: v for k, v in res.items() if k != "limits"}, ctrl.phase)
@@ -482,7 +516,13 @@ def main(argv=None) -> int:
         elif action == "mark_start":
             ctrl.mark_segment_start()
         elif action == "mark_end":
-            ctrl.mark_segment_end()
+            # [F10] doubles as REJECT when a tuning change is on screen in auto-lap
+            # (its manual-segment role only applies in MANUAL free-roam mode).
+            ui = ctrl.ui_state()
+            if ctrl.mode == C.MODE_AUTO and ctrl.phase == C.SHOW_CHANGE and ui.get("can_reject"):
+                ctrl.reject_change()
+            else:
+                ctrl.mark_segment_end()
         elif action == "view_mode":
             ctrl.toggle_view_mode()
         elif action == "support_bundle":
@@ -507,7 +547,8 @@ def main(argv=None) -> int:
             # so it never engaged. tick() must run while detecting too.)
             if ctrl.phase == C.DRIVE_AUTO:
                 if auto_box["cap"] is None:
-                    cap = PeakHeatCapture(ctrl.listener, tag=1000)
+                    cap = PeakHeatCapture(ctrl.listener, tag=1000,
+                                          console_fn=lambda: ctrl.console_mode)
                     cap.start()
                     auto_box["cap"] = cap
                     ctrl.lap_heat_fn = cap.reset_and_get

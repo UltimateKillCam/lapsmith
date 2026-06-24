@@ -32,12 +32,24 @@ def session_path(car: str, discipline: str) -> str:
     return os.path.join(SESSIONS_DIR, f"{_slug(car)}_{_slug(discipline)}.json")
 
 
+def session_log_path(car: str, discipline: str) -> str:
+    """Path of the INCREMENTAL per-session log (written progressively so a session is
+    recoverable even after a crash / force-close)."""
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    return os.path.join(SESSIONS_DIR, f"{_slug(car)}_{_slug(discipline)}_session.log")
+
+
 def save_session(state: TuneState, *, car: str, car_class: str, discipline: str,
                  front_weight_pct: float, drivetrain: str, baseline: Tune,
                  stats_log: list, started_iso: str, status: str,
                  limits=None, best_lap_s: Optional[float] = None,
-                 finished_iso: Optional[str] = None) -> str:
+                 finished_iso: Optional[str] = None,
+                 final_tune: Optional[Tune] = None) -> str:
+    """Write the per-car session JSON. `final_tune` (the BEST CONFIRMED tune) overrides
+    state.current when given, so the saved tune is never a mid-flight reverted state.
+    Writes atomically (temp + replace) so a crash mid-write can't corrupt the file."""
     path = session_path(car, discipline)
+    out = (final_tune if final_tune is not None else state.current)
     payload = {
         "car": car,
         "class": car_class,
@@ -51,14 +63,21 @@ def save_session(state: TuneState, *, car: str, car_class: str, discipline: str,
         "best_lap_s": best_lap_s,
         "iterations": state.iteration,
         "baseline": baseline.as_dict(),
-        "final_tune": state.current.as_dict(),
-        "diff_from_baseline": {k: list(v) for k, v in state.diff_from_baseline(baseline).items()},
+        "final_tune": out.as_dict(),
+        "diff_from_baseline": {k: list(v) for k, v in state.diff_from_baseline(baseline).items()}
+        if final_tune is None else
+        {k: (baseline.as_dict()[k], v) for k, v in out.as_dict().items()
+         if baseline.as_dict().get(k) != v},
         "converged_levers": sorted(state.converged_levers),
         "history": [h.as_dict() for h in state.history],
         "test_stats_log": stats_log,
     }
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)               # atomic on Windows + POSIX
     return path
 
 
@@ -148,15 +167,18 @@ def share_text(t: Tune, *, car: str, car_class: str, discipline: str,
 
 def export_tune(state: TuneState, *, car: str, car_class: str, discipline: str,
                 front_weight_pct: float, drivetrain: str,
-                best_lap_s: Optional[float] = None) -> dict:
+                best_lap_s: Optional[float] = None,
+                final_tune: Optional[Tune] = None) -> dict:
     """Write the shareable bundle for a final tune into SESSIONS_DIR and return the
     paths. Produces: a value sheet (.txt with optn.club block) and a clean JSON of
-    the final values + meta. Returns {folder, txt, json, share_text}."""
+    the final values + meta. `final_tune` (the BEST CONFIRMED tune) overrides
+    state.current. Returns {folder, txt, json, share_text}."""
     os.makedirs(SESSIONS_DIR, exist_ok=True)
+    out = (final_tune if final_tune is not None else state.current)
     base = f"{_slug(car)}_{_slug(discipline)}"
     txt_path = os.path.join(SESSIONS_DIR, base + "_final_tune.txt")
     json_path = os.path.join(SESSIONS_DIR, base + "_tune.json")
-    text = share_text(state.current, car=car, car_class=car_class, discipline=discipline,
+    text = share_text(out, car=car, car_class=car_class, discipline=discipline,
                       front_weight_pct=front_weight_pct, drivetrain=drivetrain,
                       best_lap_s=best_lap_s)
     with open(txt_path, "w", encoding="utf-8") as f:
@@ -164,7 +186,7 @@ def export_tune(state: TuneState, *, car: str, car_class: str, discipline: str,
     payload = {
         "car": car, "class": car_class, "discipline": discipline,
         "drivetrain": drivetrain, "front_weight_pct": front_weight_pct,
-        "best_lap_s": best_lap_s, "values": state.current.as_dict(),
+        "best_lap_s": best_lap_s, "values": out.as_dict(),
         "note": "manual values for the FH6 tune menu - not an in-game share code",
     }
     with open(json_path, "w", encoding="utf-8") as f:

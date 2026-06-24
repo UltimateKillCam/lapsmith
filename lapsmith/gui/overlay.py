@@ -294,6 +294,14 @@ def _render_tune(st: dict) -> str:
     if st.get("error"):
         P.append("<div style='color:#ff6b6b;font-weight:700;margin:2px 0'>"
                  f"&#9888; ERROR: {_esc(str(st['error']))}</div>")
+    # persistent console-mode notice: camber/toe less accurate (single tyre temp)
+    if st.get("console_mode"):
+        ipnote = (f" &nbsp;|&nbsp; console &#8594; this PC {_esc(st['lan_ip'])}:"
+                  f"{st.get('port', 5607)}" if st.get("lan_ip") else "")
+        P.append("<div style='font-size:11px;color:#0c0e12;background:#7fbfff;"
+                 "border-radius:5px;padding:4px 7px;margin:3px 0'>&#127918; CONSOLE MODE - "
+                 "camber/toe less accurate (single tyre temp, no 3-zone Heat reading)"
+                 f"{ipnote}</div>")
     # 2+3+4. UNMISTAKABLE state: ACTION (edit the menu) vs DRIVE (touch nothing) vs DONE.
     # Colour + header verb + presence/absence of the checklist make a timed measuring
     # lap impossible to confuse with a go-to-the-menu prompt.
@@ -310,13 +318,14 @@ def _render_tune(st: dict) -> str:
             P.append("<div style='font-size:14px;font-weight:700;margin:3px 0 0'>&bull; "
                      f"{_esc(item['label'])}: <span style='color:#7a1f1f'>{_esc(item['from'])}</span> "
                      f"&#8594; <b>{_esc(item['to'])}</b></div>")
-        if advanced:
-            for r in (st.get("batch") or []):
-                if r.get("reason"):
-                    P.append("<div style='font-size:11px;color:#3a2f10;margin-left:10px'>"
-                             f"{_esc(r['reason'])}</div>")
-        P.append("<div style='font-size:13px;font-weight:800;margin-top:5px'>"
-                 "&#9654; press F8 when applied</div></div>")
+        # one-line, telemetry-tied WHY for each proposed change (always shown)
+        for reason in (ui.get("why") or []):
+            P.append("<div style='font-size:11px;font-style:italic;color:#3a2f10;"
+                     f"margin:1px 0 0 10px'>why: {_esc(reason)}</div>")
+        foot = "&#9654; press F8 when applied"
+        if ui.get("can_reject"):
+            foot += " &nbsp;·&nbsp; [F10] reject (won't suggest again)"
+        P.append(f"<div style='font-size:13px;font-weight:800;margin-top:5px'>{foot}</div></div>")
     elif klass == "drive":
         # GREEN/BLUE, passive wording, NO checklist - do not touch anything.
         green = "#4fcc4f"
@@ -353,6 +362,21 @@ def _render_tune(st: dict) -> str:
     if st.get("last_lap_s"):
         bits.append(f"last {st['last_lap_s']:.2f}s")
     P.append(f"<div style='color:#cde;font-size:12px'>{' &nbsp;|&nbsp; '.join(bits)}</div>")
+    # PROGRESS: confirmed gains, best-vs-start, and a plain-language trend so the user
+    # can always tell if it's getting anywhere.
+    pr = st.get("progress") or {}
+    if pr.get("best_s") is not None:
+        d = pr.get("delta_vs_start_s")
+        dtxt = f" ({d:+.2f}s vs start)" if d is not None else ""
+        trend = pr.get("trend", "")
+        tcol = ("#4fcc4f" if trend in ("Improving", "Fine-tuning")
+                else "#f2b134" if "finish soon" in trend else "#9cf")
+        saved = pr.get("aba_saved", 0)
+        savetxt = f" &nbsp;·&nbsp; {saved} re-test{'s' if saved != 1 else ''} saved" if saved else ""
+        P.append("<div style='font-size:12px;font-weight:700;margin-top:2px'>"
+                 f"Confirmed gains: {pr.get('confirmed_gains', 0)} &nbsp;·&nbsp; "
+                 f"Best so far: {pr['best_s']:.2f}{dtxt}</div>"
+                 f"<div style='font-size:12px;color:{tcol}'>&#9679; {_esc(trend)}{savetxt}</div>")
     # time budget countdown (real wall-clock from the first Rivals lap)
     rem = st.get("budget_remaining_s")
     if st.get("budget_expired"):
