@@ -535,6 +535,18 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             self._refresh_console_hint(self.set_console.isChecked())
             form.addRow("", self.console_hint)
 
+            # Pressure unit: how tyre pressures are DISPLAYED everywhere (psi default).
+            # bar gets 2 decimals (the game's bar menu only shows 1, which is the point).
+            self.set_pressure_unit = QtWidgets.QComboBox()
+            self.set_pressure_unit.addItems(["psi", "bar"])
+            cur_pu = _prefs.get("pressure_unit", "psi")
+            self.set_pressure_unit.setCurrentIndex(1 if cur_pu == "bar" else 0)
+            self.set_pressure_unit.setToolTip(
+                "Unit for every tyre-pressure value shown and on the final sheet. "
+                "Internal tuning is unchanged; bar shows 2 decimals for fine adjustment.")
+            self.set_pressure_unit.currentTextChanged.connect(self._set_pressure_unit)
+            form.addRow("Pressure unit", self.set_pressure_unit)
+
             self.set_temp = QtWidgets.QComboBox()
             self.set_temp.addItems(["auto", "manual"])
             self.set_temp.setCurrentText(getattr(self.ctrl, "temp_mode", "auto"))
@@ -644,6 +656,14 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             prefs.set("console_mode", bool(on))
             self._refresh_console_hint(bool(on))
 
+        def _set_pressure_unit(self, unit):
+            """Persist the pressure display unit and apply it live to the controller so
+            the next checklist / overlay / final sheet uses it immediately."""
+            from ..state import prefs
+            unit = unit if unit in ("psi", "bar") else "psi"
+            prefs.set("pressure_unit", unit)
+            self.ctrl.pressure_unit = unit
+
         def _refresh_console_hint(self, on):
             if on:
                 ip = self.ctrl.lan_ip()
@@ -724,13 +744,9 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             if fn:
                 fn()
 
-        def closeEvent(self, ev):
-            # closing hides to the tray; the app keeps running (telemetry + overlay
-            # stay alive). Only the tray Quit action actually exits.
-            ev.ignore()
-            self.hide()
-            notify = self.hooks.get("on_hidden")
-            if notify:
-                notify()
+        # NOTE: closeEvent is defined ONCE, above (it runs the authoritative quit). A
+        # second closeEvent here previously RE-DEFINED it to hide-to-tray, which (being
+        # later in the class body) silently overrode the quit handler and left the
+        # process + UDP port alive after the X - the v0.1.13 regression. Do not re-add.
 
     return MainWindow()

@@ -299,6 +299,12 @@ def _render_tune(st: dict) -> str:
         P.append("<div style='font-size:12px;font-weight:800;color:#0c0e12;background:#ffd479;"
                  "border-radius:5px;padding:5px 8px;margin:3px 0'>&#9888; NO TELEMETRY - "
                  f"{_esc(st['telemetry_diagnostic'])}</div>")
+    # car detected but the stream paused (Forza lost focus): reassure, don't alarm -
+    # the detection is retained, the user can keep reading the overlay out of focus.
+    _det = st.get("detection") or {}
+    if _det.get("state") == "car_detected" and _det.get("live") is False:
+        P.append("<div style='font-size:11px;color:#9aa'>&#9208; Telemetry paused "
+                 "(game out of focus) - detected car retained.</div>")
     # persistent notice: the in-game Heat SCREEN can't be read (telemetry is fine) so
     # camber/toe are limited to lap-time tuning on tarmac.
     if st.get("temp_blind"):
@@ -374,6 +380,12 @@ def _render_tune(st: dict) -> str:
     if st.get("last_lap_s"):
         bits.append(f"last {st['last_lap_s']:.2f}s")
     P.append(f"<div style='color:#cde;font-size:12px'>{' &nbsp;|&nbsp; '.join(bits)}</div>")
+    # #5: fastest CLEAN lap actually driven this session - shown so the user is never told
+    # their best is slower than a lap they just turned (it may be on a reverted change).
+    fld = st.get("fastest_lap_driven_s")
+    if fld:
+        P.append("<div style='font-size:12px;color:#7fd3ff'>"
+                 f"&#9201; Fastest lap driven: {fld:.2f}s</div>")
     # PROGRESS: confirmed gains, best-vs-start, and a plain-language trend so the user
     # can always tell if it's getting anywhere.
     pr = st.get("progress") or {}

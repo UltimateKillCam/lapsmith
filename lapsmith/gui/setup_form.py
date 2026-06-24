@@ -71,6 +71,15 @@ def show_setup_dialog(detected_summary: str = "",
     disc.addItems(_DISCIPLINES)
     form.addRow("Discipline", disc)
 
+    # Tyre compound: NOT in telemetry, so the user sets it (default Unspecified - we
+    # never assert a compound they didn't pick). The discipline-appropriate option is
+    # pre-highlighted as a hint, but stays the user's choice.
+    compound = QtWidgets.QComboBox()
+    compound.addItems(baseline.COMPOUNDS)
+    compound.setToolTip("Your in-game tyre compound. Not available from telemetry, so "
+                        "pick it here - the final tune sheet shows exactly what you choose.")
+    form.addRow("Tyre compound", compound)
+
     # Drivetrain override (safety net for a misdetected DrivetrainType). Default
     # Auto-detect uses the telemetry value; FWD/RWD/AWD force it so the diff rules
     # only ever touch a diff the car actually has.
@@ -247,4 +256,5 @@ def show_setup_dialog(detected_summary: str = "",
             "time_budget_min": float(budget.value()),   # 0 = unlimited
             "console_mode": bool(console.isChecked()),
             "drivetrain": ("auto", "FWD", "RWD", "AWD")[dt.currentIndex()],
-            "use_vision_api": bool(vapi.isChecked())}
+            "use_vision_api": bool(vapi.isChecked()),
+            "compound": compound.currentText()}

@@ -32,6 +32,12 @@ BOTTOM_THRESH = 0.05      # normalized susp travel <= this = bottoming (road/tar
 # Dirt/CC cars sit and travel low; some bottoming is expected and acceptable, so a
 # LOWER threshold there means we only chase genuinely severe bottoming, not forever.
 BOTTOM_THRESH_DIRT = 0.02
+# Only chase WIDESPREAD bottoming, not a localized kerb/sidewalk strike. From the
+# per-track-position bins (24/lap): fire if the car bottoms over >= this FRACTION of
+# the lap OR in >= this many distinct ZONES. One kerb = ~1 bin (4%, 1 zone); two
+# sidewalks = ~2 bins (8%, 2 zones) - both stay below these and are ignored.
+BOTTOM_MIN_FRAC = 0.13    # >= 13% of lap distance bottoms = widespread
+BOTTOM_MIN_ZONES = 3      # or bottoming at >= 3 distinct track positions
 STIFF_THRESH = 0.55       # never drops below this = under-using travel
 # vertical-accel RMS above this = a busy/harsh ride (the car is being bounced) -> the
 # bump damping is too stiff. A richer trigger so damping engages on real oscillation,
@@ -168,6 +174,20 @@ def _filter_rejected(rec: "Recommendation", rejected_fields) -> Optional["Recomm
     return rec
 
 
+def _filter_tried_values(rec: "Recommendation", tried_values) -> Optional["Recommendation"]:
+    """#3: drop any field whose proposed value EXACTLY matches one already tried and
+    reverted - don't show the user the identical change that just failed. None if every
+    field is a repeat (the rule must step elsewhere or move on, not rely on the cap)."""
+    if not tried_values:
+        return rec
+    kept = {f: v for f, v in rec.fields.items()
+            if round(float(v), 2) not in tried_values.get(f, ())}
+    if not kept:
+        return None
+    rec.fields = kept
+    return rec
+
+
 def _round(v: float, q: float = 0.1) -> float:
     return round(round(v / q) * q, 3)
 
@@ -242,7 +262,8 @@ def analyze_batch(stats: TestStats, tune: Tune, discipline: str,
                   step_mult: float = 1.0,
                   bottoming_attempts: Optional[dict] = None,
                   lever_locked: Optional[set] = None,
-                  rejected_fields: Optional[set] = None) -> List[Recommendation]:
+                  rejected_fields: Optional[set] = None,
+                  tried_values: Optional[dict] = None) -> List[Recommendation]:
     """Build a BATCH for one test lap: ALL firing evidence-driven changes (each
     justified by its own measurement) plus up to `max_search` search-driven
     (handling-cluster) changes. Returns [] if nothing fires.
@@ -294,13 +315,26 @@ def analyze_batch(stats: TestStats, tune: Tune, discipline: str,
             trace.append(f"{name}=SKIP(rejected by user this session: {list(rec.fields)})")
             continue
         rec = rj
+        tv = _filter_tried_values(rec, tried_values)
+        if tv is None:
+            trace.append(f"{name}=SKIP(same value already tried+reverted: {dict(rec.fields)})")
+            continue
+        rec = tv
         rec.kind = _kind_of(rec.group)
         trace.append(f"{name}=FIRE {rec.group}{list(rec.fields)}")
         for k, v in rec.fields.items():     # accumulate so later rules see it
             work.set(k, v)
         (evidence if rec.kind == "evidence" else search).append(rec)
 
-    batch = evidence + search[:max(0, max_search)]
+    # #4: don't bundle an exploratory SEARCH change with a BOTTOMING evidence change.
+    # A bottoming batch gets reverted for ride-height reasons; an unrelated ARB/damping
+    # search bundled into it would be discarded with it and never judged on its own.
+    # Hold the search changes - they're re-proposed on a later (non-bottoming) lap.
+    has_bottoming = any(getattr(r, "symptom", "").startswith("bottoming") for r in evidence)
+    search_allowed = [] if has_bottoming else search[:max(0, max_search)]
+    if has_bottoming and search:
+        trace.append(f"SEARCH-HELD({len(search)}: bottoming batch tests alone)")
+    batch = evidence + search_allowed
     chosen = {id(r) for r in batch}
     # One line per iteration: every rule's verdict + reason, plus what made the cut.
     # This is the diagnostic for "stuck on the same lever / never proposes springs".
@@ -413,22 +447,37 @@ def _rule_ride(stats, tune, disc, tyre_reading, road_band, limits,
     # push, so the bottoming remedy avoids it and prefers ride height / spring.
     understeer = (stats.n_corner_frames >= 10
                   and (stats.slip_angle_front - stats.slip_angle_rear) > US_DEG)
+    ff, zf, fr, zr = stats.bottoming_coverage(thresh)
+    have_coverage = bool(stats.susp_bin_min_front or stats.susp_bin_min_rear)
     for axle in ("front", "rear"):
         if axle in bottoming_locked:
             continue                       # cap hit / gate reverted - leave it be
         susp_min = stats.susp_min_front if axle == "front" else stats.susp_min_rear
-        if susp_min <= thresh:
-            return _bottoming_fix(axle, susp_min, tune, disc, limits,
-                                  ride_ineffective=(axle in ride_locked),
-                                  understeer=understeer,
-                                  attempts=bottoming_attempts.get(axle, 0),
-                                  step_mult=step_mult, thresh=thresh)
+        if susp_min > thresh:
+            continue
+        frac, zones = (ff, zf) if axle == "front" else (fr, zr)
+        # Localized? A single kerb/sidewalk strike bottoms one spot, not the lap.
+        # Ignore it rather than raise ride height for the whole lap and get reverted.
+        if have_coverage and not (frac >= BOTTOM_MIN_FRAC or zones >= BOTTOM_MIN_ZONES):
+            _rlog.info("RIDE %s bottoming localized to %d zone(s) / %.0f%% of lap "
+                       "(min=%.3f<=%.3f) - isolated kerb/strike, ignoring.",
+                       axle, zones, frac * 100, susp_min, thresh)
+            continue
+        if have_coverage:
+            _rlog.info("RIDE %s bottoming WIDESPREAD: %d zone(s) / %.0f%% of lap "
+                       "(min=%.3f<=%.3f) - raising ride height.",
+                       axle, zones, frac * 100, susp_min, thresh)
+        return _bottoming_fix(axle, susp_min, tune, disc, limits,
+                              ride_ineffective=(axle in ride_locked),
+                              understeer=understeer,
+                              attempts=bottoming_attempts.get(axle, 0),
+                              step_mult=step_mult, thresh=thresh, frac=frac, zones=zones)
     return None
 
 
 def _bottoming_fix(axle, susp_min, tune, disc, limits, ride_ineffective=False,
-                   understeer=False, attempts=0, step_mult=1.0, thresh=BOTTOM_THRESH
-                   ) -> Optional[Recommendation]:
+                   understeer=False, attempts=0, step_mult=1.0, thresh=BOTTOM_THRESH,
+                   frac=0.0, zones=0) -> Optional[Recommendation]:
     """Escalate one capped lever at a time: ride height -> bump -> spring. Skip the
     ride-height step when it's at the CAR's max OR stopped reducing bottoming
     (`ride_ineffective`). BALANCE-AWARE: with understeer present, avoid stiffening
@@ -440,6 +489,7 @@ def _bottoming_fix(axle, susp_min, tune, disc, limits, ride_ineffective=False,
     sp = f"spring_{axle[0]}"
     rh_max = _ride_cap(disc, limits, rh)
     symptom = f"bottoming_{axle}"
+    spread = (f" over {frac * 100:.0f}% of the lap ({zones} zones)" if zones else "")
     mult = step_mult * (1 + max(0, attempts))     # escalate per repeat on this axle
 
     can_raise = (tune.get(rh) < rh_max - 1e-6 and not limits.at_max(rh, tune.get(rh))
@@ -447,7 +497,7 @@ def _bottoming_fix(axle, susp_min, tune, disc, limits, ride_ineffective=False,
     if can_raise:
         new = _round(tune.get(rh) + RIDE_STEP * mult)
         return Recommendation("ride_height", {rh: new},
-            f"{label} bottoming: min normalized travel {susp_min:.2f} <= {thresh}.",
+            f"{label} bottoming{spread}: min normalized travel {susp_min:.2f} <= {thresh}.",
             f"No more harsh {label.lower()} crashes over bumps; steadier end.",
             f"{label} ride height {tune.get(rh):.1f} -> {new:.1f} cm", symptom=symptom)
 

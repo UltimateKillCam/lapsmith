@@ -135,7 +135,15 @@ def backend_name() -> str:
 
 
 def screen_size() -> Optional[Tuple[int, int]]:
-    """Primary-monitor (width, height) for the support-bundle env info, or None."""
+    """Primary-monitor (width, height). Pillow's ImageGrab is the always-bundled path
+    (mss/pyautogui aren't installed in the frozen build, which left this None -> the
+    support bundle's resolution showed null). None only if every backend fails."""
+    try:
+        from PIL import ImageGrab
+        img = ImageGrab.grab()
+        return (int(img.width), int(img.height))
+    except Exception:
+        pass
     try:
         import mss
         with mss.mss() as s:

@@ -90,11 +90,13 @@ def load_session(car: str, discipline: str) -> Optional[dict]:
 
 
 def save_final_tune_txt(t: Tune, *, car: str, car_class: str, discipline: str,
-                        front_weight_pct: float, drivetrain: str) -> str:
+                        front_weight_pct: float, drivetrain: str,
+                        pressure_unit: str = "psi") -> str:
     from ..knowledge.baseline import format_checklist
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     path = os.path.join(SESSIONS_DIR, f"{_slug(car)}_{_slug(discipline)}_final_tune.txt")
-    body = format_checklist(t, car, car_class, discipline, front_weight_pct, drivetrain)
+    body = format_checklist(t, car, car_class, discipline, front_weight_pct, drivetrain,
+                            pressure_unit=pressure_unit)
     body = body.replace("INITIAL TUNE", "FINAL TUNE", 1)
     share = _optn_club_block(t, drivetrain)
     with open(path, "w", encoding="utf-8") as f:
@@ -154,11 +156,12 @@ _SHARE_DISCLAIMER = (
 
 def share_text(t: Tune, *, car: str, car_class: str, discipline: str,
                front_weight_pct: float, drivetrain: str,
-               best_lap_s: Optional[float] = None) -> str:
+               best_lap_s: Optional[float] = None, pressure_unit: str = "psi") -> str:
     """The full human-readable value sheet + optn.club block + disclaimer. This is
     exactly what the 'copy to clipboard' button copies."""
     from ..knowledge.baseline import format_checklist
-    body = format_checklist(t, car, car_class, discipline, front_weight_pct, drivetrain)
+    body = format_checklist(t, car, car_class, discipline, front_weight_pct, drivetrain,
+                            pressure_unit=pressure_unit)
     body = body.replace("INITIAL TUNE", "FINAL TUNE", 1)
     if best_lap_s:
         body += f"\n\nBest lap this session: {best_lap_s:.2f}s"
@@ -168,7 +171,8 @@ def share_text(t: Tune, *, car: str, car_class: str, discipline: str,
 def export_tune(state: TuneState, *, car: str, car_class: str, discipline: str,
                 front_weight_pct: float, drivetrain: str,
                 best_lap_s: Optional[float] = None,
-                final_tune: Optional[Tune] = None) -> dict:
+                final_tune: Optional[Tune] = None,
+                pressure_unit: str = "psi") -> dict:
     """Write the shareable bundle for a final tune into SESSIONS_DIR and return the
     paths. Produces: a value sheet (.txt with optn.club block) and a clean JSON of
     the final values + meta. `final_tune` (the BEST CONFIRMED tune) overrides
@@ -180,7 +184,7 @@ def export_tune(state: TuneState, *, car: str, car_class: str, discipline: str,
     json_path = os.path.join(SESSIONS_DIR, base + "_tune.json")
     text = share_text(out, car=car, car_class=car_class, discipline=discipline,
                       front_weight_pct=front_weight_pct, drivetrain=drivetrain,
-                      best_lap_s=best_lap_s)
+                      best_lap_s=best_lap_s, pressure_unit=pressure_unit)
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(text + "\n")
     payload = {

@@ -114,8 +114,9 @@ class CarLimits:
 # Canonical lever set. Values are exact, type-faithful to the in-game menu.
 @dataclass
 class Tune:
-    # tyres
-    tyre_compound: str = "Slick"
+    # tyres - compound is NOT in telemetry, so it's user-set (default unspecified;
+    # never asserted as Slick). psi is the canonical internal unit (display can convert).
+    tyre_compound: str = "Unspecified"
     pressure_f: float = 29.0          # psi
     pressure_r: float = 29.0
     # alignment

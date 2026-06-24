@@ -40,6 +40,11 @@ class TestStats:
     susp_min_rear: float = 1.0
     susp_max_front: float = 0.0
     susp_max_rear: float = 0.0
+    # bottoming COVERAGE: per track-position bin, the MIN normalized travel in that
+    # bin. Lets us tell a localized kerb/sidewalk strike (1 bin) from widespread
+    # bottoming (many bins) instead of chasing the single worst spike on the lap.
+    susp_bin_min_front: list = field(default_factory=list)
+    susp_bin_min_rear: list = field(default_factory=list)
 
     # balance: mean tyre slip ANGLE (deg) per axle, only in the high-G window
     slip_angle_front: float = 0.0
@@ -101,6 +106,23 @@ class TestStats:
             "rear_avg": (self.temp_rl + self.temp_rr) / 2,
         }
 
+    def bottoming_coverage(self, thresh: float):
+        """How WIDESPREAD is the bottoming, from the per-track-position bins.
+        Returns (frac_front, zones_front, frac_rear, zones_rear): the fraction of
+        lap bins where the axle's min travel <= thresh, and the count of distinct
+        contiguous zones. A localized kerb strike is ~1 bin / 1 zone; a too-low car
+        bottoms across many. Empty (no coverage data) -> (0, 0)."""
+        def cov(bins):
+            if not bins:
+                return 0.0, 0
+            hit = [b <= thresh for b in bins]
+            frac = sum(hit) / len(bins)
+            zones = sum(1 for i, h in enumerate(hit) if h and (i == 0 or not hit[i - 1]))
+            return frac, zones
+        ff, zf = cov(self.susp_bin_min_front)
+        fr, zr = cov(self.susp_bin_min_rear)
+        return ff, zf, fr, zr
+
     def channels_available(self) -> dict:
         """Which richer telemetry channels carried signal this measurement, so a rule
         can degrade gracefully and the session log can record what was live."""
@@ -141,6 +163,29 @@ def aggregate(packets: List[Packet]) -> TestStats:
     s.susp_min_rear = min(rear_norm) if rear_norm else 1.0
     s.susp_max_front = max([max(p.susp_norm_fl, p.susp_norm_fr) for p in moving], default=0.0)
     s.susp_max_rear = max([max(p.susp_norm_rl, p.susp_norm_rr) for p in moving], default=0.0)
+
+    # bottoming COVERAGE (#1): bin moving frames by track position (DistanceTraveled,
+    # else X, else lap timer) so the ride rule can require WIDESPREAD bottoming, not a
+    # single kerb spike. Each bin holds the worst (min) travel seen at that point.
+    N_BOTTOM_BINS = 24
+    if len(moving) >= N_BOTTOM_BINS:
+        for fld in ("distance_traveled", "position_x"):
+            pv = [getattr(p, fld) for p in moving]
+            if max(pv) - min(pv) > 1.0:
+                break
+        else:
+            pv = [p.current_lap for p in moving]
+        lo = min(pv)
+        span = (max(pv) - min(pv)) or 1.0
+        fb = [1.0] * N_BOTTOM_BINS
+        rb = [1.0] * N_BOTTOM_BINS
+        for p, x in zip(moving, pv):
+            b = int((x - lo) / span * N_BOTTOM_BINS)
+            b = 0 if b < 0 else (N_BOTTOM_BINS - 1 if b >= N_BOTTOM_BINS else b)
+            fb[b] = min(fb[b], p.susp_norm_fl, p.susp_norm_fr)
+            rb[b] = min(rb[b], p.susp_norm_rl, p.susp_norm_rr)
+        s.susp_bin_min_front = fb
+        s.susp_bin_min_rear = rb
 
     # balance window: high lateral g
     corner = [p for p in moving if abs(p.lateral_g) >= HIGH_G_THRESHOLD]

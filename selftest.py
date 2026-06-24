@@ -576,13 +576,13 @@ def test_drivetrain_detection():
     check("raw DrivetrainType captured = 1", supra.drivetrain_raw == 1)
     check("NumCylinders@228 reads 6 (2JZ inline-6 sanity)", supra.num_cylinders == 6)
 
-    # re-read every frame: a drivetrain swap (AWD conversion) IS reflected
+    # re-read every LIVE frame: a drivetrain swap (AWD conversion) IS reflected
     class _Stub:
-        def __init__(self, p): self.pkt = p; self.last_packet_time = 1.0
+        def __init__(self, p): self.pkt = p; self.last_packet_time = time.time()
         def snapshot(self): return self.pkt
     ctrl = C.Controller()
     ctrl.identity = identity.identify(_car_packet(1, 6))       # starts RWD
-    ctrl.listener = _Stub(_car_packet(2, 6))                   # now reads AWD
+    ctrl.listener = _Stub(_car_packet(2, 6))                   # now reads AWD (same ordinal)
     ctrl.refresh_identity()
     check("drivetrain swap reflected on re-read (RWD -> AWD)", ctrl.identity.drivetrain == "AWD")
     check("status surfaces raw drivetrain + cylinders",
@@ -1807,6 +1807,314 @@ def test_recalibration_v0116():
           rules.WARMUP_LAPS == 1)
 
 
+def test_v0120_detection_pause_resilience():
+    print("\n== v0.1.20: car detection survives a focus-loss PAUSE; pause vs car-change by ordinal ==")
+    from lapsmith.gui import controller as C
+
+    class _Lis:
+        def __init__(self): self.pkt = None; self.last_packet_time = 0.0; self.packet_count = 0
+        def snapshot(self): return self.pkt
+        def drain_since(self, m): return []
+        def feed(self, pkt, fresh=True):
+            self.pkt = pkt; self.packet_count += 1
+            self.last_packet_time = time.time() if fresh else time.time() - 60
+
+    c = C.Controller(); c.phase = C.WAIT_TELEMETRY
+    lis = _Lis(); c.listener = lis
+    check("before any packet -> no_telemetry", c.detection_state()["state"] == "no_telemetry")
+
+    # detect car A on a LIVE frame
+    lis.feed(_car_packet(1, 6, ordinal=568), fresh=True)
+    c.track_identity()
+    check("car detected from a live frame (ordinal 568)",
+          c.identity is not None and c.identity.ordinal == 568)
+    check("detection advances WAIT_TELEMETRY -> CONFIRM_CAR", c.phase == C.CONFIRM_CAR)
+    ds = c.detection_state()
+    check("while live -> car_detected (live)", ds["state"] == "car_detected" and ds["live"])
+
+    # PAUSE (game lost focus): stream goes stale, identity MUST persist
+    lis.last_packet_time = time.time() - 60
+    c.track_identity()                              # ticking during the pause
+    check("identity persists across the pause (not cleared)",
+          c.identity is not None and c.identity.ordinal == 568)
+    ds = c.detection_state()
+    check("paused -> still car_detected but flagged not-live, reassuring message",
+          ds["state"] == "car_detected" and ds["live"] is False
+          and "paused" in ds["message"].lower())
+
+    # RESUME with the SAME ordinal -> same car, carry on
+    lis.feed(_car_packet(1, 6, ordinal=568), fresh=True)
+    c.track_identity()
+    check("resume with SAME ordinal keeps the same car", c.identity.ordinal == 568)
+
+    # a STALE frame with a DIFFERENT ordinal must NOT trigger a car change
+    lis.pkt = _car_packet(2, 8, ordinal=999); lis.last_packet_time = time.time() - 60
+    c.track_identity()
+    check("a STALE different-ordinal frame does NOT switch cars (acts only on live)",
+          c.identity.ordinal == 568)
+
+    # RESUME with a DIFFERENT ordinal on a LIVE frame -> real car change, re-detect
+    lis.feed(_car_packet(2, 8, ordinal=999), fresh=True)
+    c.track_identity()
+    check("resume with a DIFFERENT ordinal (live) re-detects the new car",
+          c.identity.ordinal == 999 and c.identity.drivetrain == "AWD")
+
+    # IDENTITY vs MEASUREMENT staleness: a frozen frame is not 'live' for a measurement
+    lis.last_packet_time = time.time() - 60
+    check("a frozen frame is NOT telemetry_live (no measurement off stale data)",
+          c.telemetry_live() is False and c.identity is not None)
+    lis.last_packet_time = time.time()
+    check("a fresh frame IS telemetry_live", c.telemetry_live() is True)
+
+    # FIRST detection works even if the only frame ever seen is now stale (seen then paused)
+    c2 = C.Controller(); c2.phase = C.WAIT_TELEMETRY
+    lis2 = _Lis(); lis2.pkt = _car_packet(1, 6, ordinal=568); lis2.packet_count = 5
+    lis2.last_packet_time = time.time() - 60       # the car WAS seen, then the game paused
+    c2.listener = lis2
+    c2.track_identity()
+    check("first-detect from a last-seen (now stale) frame still works - no need to keep "
+          "the game focused", c2.identity is not None and c2.identity.ordinal == 568)
+
+    # MID-SESSION car change -> prompt to set up again (don't tune the new car stale)
+    from lapsmith.state.tune_state import CarLimits
+    from lapsmith import identity as _idmod
+    c4 = C.Controller()
+    c4.identity = _idmod.identify(_car_packet(1, 6, ordinal=568))
+    c4.apply_setup("road", CarLimits())            # baseline built -> session active
+    c4.phase = C.DRIVE_AUTO
+    lis4 = _Lis(); c4.listener = lis4
+    lis4.feed(_car_packet(2, 8, ordinal=999), fresh=True)   # a DIFFERENT car, live
+    c4.track_identity()
+    pend = c4.pending_car_change()
+    check("mid-session car change flags a pending re-setup prompt",
+          pend is not None and pend["ordinal"] == 999 and pend["old"])
+    check("identity updates to the new car (not left stale)", c4.identity.ordinal == 999)
+    check("status surfaces the pending car change for the GUI prompt",
+          (c4.status().get("car_change_pending") or {}).get("ordinal") == 999)
+    c4.clear_car_change()
+    check("clear_car_change consumes it (prompt fires once)", c4.pending_car_change() is None)
+
+    # a car change BEFORE setup (pre-session) is a plain re-detect, NOT a prompt
+    c5 = C.Controller(); c5.phase = C.WAIT_TELEMETRY
+    lis5 = _Lis(); c5.listener = lis5
+    lis5.feed(_car_packet(1, 6, ordinal=568), fresh=True); c5.track_identity()
+    lis5.feed(_car_packet(2, 8, ordinal=999), fresh=True); c5.track_identity()
+    check("pre-setup car change re-detects without a prompt",
+          c5.identity.ordinal == 999 and c5.pending_car_change() is None)
+
+
+def test_v0119_shutdown_units_compound_detection():
+    print("\n== v0.1.19: clean-exit guard, psi/bar, compound passthrough, robust detection ==")
+    import inspect
+    from lapsmith.gui import controller as C, main_window
+    from lapsmith.knowledge import baseline as B
+    from lapsmith.knowledge.baseline import build_baseline, format_checklist, fmt_pressure, fmt_field
+    from lapsmith.state.tune_state import Tune, CarLimits
+    from lapsmith import identity
+
+    # ---- SHUTDOWN regression guard: exactly ONE closeEvent, and it QUITS -----------
+    src = inspect.getsource(main_window.build_main_window)
+    check("MainWindow defines closeEvent exactly once (no hide-to-tray re-definition)",
+          src.count("def closeEvent") == 1)
+    check("the surviving closeEvent runs the quit hook (X exits, not hide-to-tray)",
+          'hooks.get("quit")' in src or "hooks.get('quit')" in src)
+    appsrc = inspect.getsource(__import__("lapsmith.gui.app", fromlist=["main"]).main)
+    check("startup force-terminates on exit so native OCR/cv2/keyboard threads can't "
+          "hold the port (os._exit)", "os._exit(" in appsrc)
+
+    # ---- A) psi <-> bar conversion (1 bar = 14.5038 psi) ---------------------------
+    check("psi display is unchanged", fmt_pressure(29.0, "psi") == "29.0 psi")
+    check("29.0 psi shows ~2.00 bar (2 decimals, finer than the game's 1)",
+          fmt_pressure(29.0, "bar") == "2.00 bar")
+    check("bar->psi round-trips within rounding",
+          abs(B.pressure_to_psi(2.0, "bar") - 29.0076) < 0.01)
+    check("psi unit is a no-op for pressure_to_psi", B.pressure_to_psi(29.0, "psi") == 29.0)
+    check("fmt_field converts the pressure field to the chosen unit",
+          fmt_field("pressure_f", 29.0, "bar") == "2.00 bar" and
+          fmt_field("pressure_f", 29.0, "psi") == "29.0 psi")
+    check("non-pressure fields are unaffected by the unit arg",
+          fmt_field("camber_f", -1.5, "bar") == "-1.5 deg")
+
+    # ---- C) compound is user-set; NEVER silently 'Slick' when the user picked Rally -
+    check("Tune default compound is 'Unspecified', not 'Slick'", Tune().tyre_compound == "Unspecified")
+    t_rally = build_baseline("Car", "S1 800", "road", 50.0, "RWD", compound="Rally")
+    check("user-chosen Rally compound passes through verbatim on a ROAD build",
+          t_rally.tyre_compound == "Rally")
+    sheet = format_checklist(t_rally, "Car", "S1 800", "road", 50.0, "RWD")
+    check("final sheet shows the user's Rally compound, NOT a hardcoded Slick",
+          "Rally" in sheet and "Slick" not in sheet)
+    t_unset = build_baseline("Car", "S1 800", "road", 50.0, "RWD", compound="Unspecified")
+    check("Unspecified stays Unspecified (never asserted as Slick)",
+          t_unset.tyre_compound == "Unspecified")
+    # the sheet honours the pressure unit too
+    bar_sheet = format_checklist(t_rally, "Car", "S1 800", "road", 50.0, "RWD", pressure_unit="bar")
+    check("final sheet pressures render in the selected unit (bar)",
+          "bar" in bar_sheet and "psi" not in bar_sheet.split("ALIGNMENT")[0])
+    # apply_setup path: compound + unit reach the controller and its checklist
+    c = C.Controller(); c.identity = identity.identify(
+        parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+    c.apply_setup("road", CarLimits(), compound="Rally", pressure_unit="bar")
+    check("apply_setup stores the user's compound + unit on the controller",
+          c.tyre_compound == "Rally" and c.pressure_unit == "bar")
+    check("controller baseline checklist shows Rally + bar (no Slick, no psi pressure)",
+          "Rally" in c.baseline_checklist() and "Slick" not in c.baseline_checklist())
+
+    # ---- D) detection state: no-telemetry vs telemetry-no-car vs car-detected ------
+    c2 = C.Controller()
+    check("no listener / 0 packets -> 'no_telemetry' state",
+          c2.detection_state()["state"] == "no_telemetry")
+
+    class _Lis:
+        packet_count = 7
+        def drain_since(self, m): return []
+        def snapshot(self): return None
+    c2.listener = _Lis()
+    check("packets arriving but no car -> 'telemetry_no_car'",
+          c2.detection_state()["state"] == "telemetry_no_car"
+          and "no car seen yet" in c2.detection_state()["message"].lower())
+
+    # poll_identity detects a car at a STANDSTILL (race off, speed 0, ordinal>0)
+    spkt = parse(simulator._build_packet(simulator.frame(0.5, "understeer")))
+    spkt.speed = 0.0
+    spkt.is_race_on = False
+    if spkt.car_ordinal <= 0:
+        spkt.car_ordinal = 2468
+
+    class _LisStat:
+        packet_count = 9
+        def drain_since(self, m): return []      # nothing 'moving'
+        def snapshot(self): return spkt
+    c3 = C.Controller(); c3.listener = _LisStat(); c3.phase = C.WAIT_TELEMETRY
+    ident = c3.poll_identity()
+    check("car detected from a stationary frame (no movement / race-off needed)",
+          ident is not None and c3.identity is not None)
+    check("detection advances WAIT_TELEMETRY -> CONFIRM_CAR", c3.phase == C.CONFIRM_CAR)
+    check("once detected, state is 'car_detected'",
+          c3.detection_state()["state"] == "car_detected")
+
+
+def test_session_fixes_v0118():
+    print("\n== v0.1.18: bottoming-coverage, OCR udp fallback, no re-propose, search/bottom split, fastest lap ==")
+    from lapsmith.gui import controller as C
+    from lapsmith.knowledge import rules
+    from lapsmith.state.tune_state import CarLimits, Tune
+    from lapsmith.telemetry.session import TestStats
+    from lapsmith import identity
+    from lapsmith.vision import capture
+    import lapsmith.vision.read_tyres as RT
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+
+    # ---- #1: bottoming fires only when WIDESPREAD, not for a localized kerb strike ----
+    def _bottom_stats(zones_pattern):
+        s = TestStats()
+        s.n_corner_frames = 30
+        s.susp_min_front = 0.01      # a real dip exists somewhere
+        s.susp_bin_min_front = list(zones_pattern)
+        s.susp_bin_min_rear = [1.0] * len(zones_pattern)
+        return s
+    thr = rules.BOTTOM_THRESH
+    # one kerb: a single bin below threshold (1 zone, ~4% of lap)
+    localized = _bottom_stats([1.0] * 23 + [0.01])
+    rec = rules._rule_ride(localized, Tune(), "road", None, True, CarLimits())
+    check("#1 localized 1-zone bottoming (kerb) is IGNORED, not chased",
+          rec is None or not rec.is_change())
+    # two sidewalks: 2 isolated bins (2 zones, ~8%) - still below the widespread gate
+    two = _bottom_stats([0.01] + [1.0] * 11 + [0.01] + [1.0] * 11)
+    rec2 = rules._rule_ride(two, Tune(), "road", None, True, CarLimits())
+    check("#1 two isolated sidewalk strikes still IGNORED (below widespread gate)",
+          rec2 is None or not rec2.is_change())
+    # genuinely too-low car: bottoms across most of the lap
+    wide = _bottom_stats([0.01] * 18 + [1.0] * 6)
+    rec3 = rules._rule_ride(wide, Tune(), "road", None, True, CarLimits())
+    check("#1 WIDESPREAD bottoming (75% of lap) DOES fire ride-height",
+          rec3 is not None and rec3.is_change() and rec3.group == "ride_height")
+    ff, zf, fr, zr = wide.bottoming_coverage(thr)
+    check("#1 coverage reports a high fraction + one contiguous zone for a too-low car",
+          ff >= rules.BOTTOM_MIN_FRAC and zf == 1)
+    # graceful degrade: NO coverage data -> behave like before (single-min fires)
+    nocov = TestStats(); nocov.susp_min_front = 0.01; nocov.n_corner_frames = 30
+    rec4 = rules._rule_ride(nocov, Tune(), "road", None, True, CarLimits())
+    check("#1 with no coverage data, falls back to single-min behaviour (fires)",
+          rec4 is not None and rec4.is_change())
+
+    # ---- #2: screen_size populated (resolution no longer null) + UDP-single fallback ----
+    sz = capture.screen_size()
+    check("#2 screen_size() returns a real (w,h) via Pillow (resolution not null)",
+          sz is not None and sz[0] > 0 and sz[1] > 0)
+    c = C.Controller(); c.identity = ident; c.apply_setup("road", CarLimits())
+    c.discipline = "road"
+    orig = (RT.rapidocr_available, RT.ocr_heat_page, RT.vision_available)
+    RT.rapidocr_available = lambda: False
+    RT.ocr_heat_page = lambda *a, **k: None
+    RT.vision_available = lambda: False
+    try:
+        c._read_heat("frame.png", peak_g=1.0,
+                     udp_temps={"FL": 80, "FR": 81, "RL": 78, "RR": 79})
+        check("#2 OCR fails BUT UDP temps present -> 'udp_single' path (not blind search)",
+              c.last_reader == "udp_single")
+        c._read_heat("frame.png", peak_g=1.0, udp_temps=None)
+        check("#2 OCR fails AND no UDP temps -> blind 'camber_search'",
+              c.last_reader == "camber_search")
+    finally:
+        RT.rapidocr_available, RT.ocr_heat_page, RT.vision_available = orig
+
+    # ---- #3: never re-propose the EXACT value already tried+reverted ----
+    rec_same = rules.Recommendation("diff", {"diff_rear_decel": 10.0}, "r", "f")
+    check("#3 a re-proposed identical reverted value is filtered out",
+          rules._filter_tried_values(rec_same, {"diff_rear_decel": {10.0}}) is None)
+    rec_diff = rules.Recommendation("diff", {"diff_rear_decel": 12.0}, "r", "f")
+    out = rules._filter_tried_values(rec_diff, {"diff_rear_decel": {10.0}})
+    check("#3 a DIFFERENT value is still allowed (step elsewhere, not lock-only)",
+          out is not None and out.fields == {"diff_rear_decel": 12.0})
+    c2 = C.Controller(); c2.apply_setup("road", CarLimits())
+    c2.state.current.set("diff_rear_decel", 15.0)
+    applied = c2.state.apply_change("diff", {"diff_rear_decel": 10.0}, "r", "f")
+    c2._applied_records = [applied]
+    c2._revert_batch()
+    check("#3 revert records the tried value AND restores the previous",
+          10.0 in c2._tried_values.get("diff_rear_decel", set())
+          and c2.state.current.get("diff_rear_decel") == 15.0)
+
+    # ---- #4: a search change is NOT bundled into a bottoming batch ----
+    s = TestStats()
+    s.drivetrain = "RWD"; s.n_corner_frames = 30
+    s.slip_angle_front = 0.45; s.slip_angle_rear = 0.15      # understeer -> ARB search
+    s.susp_min_front = 0.01
+    s.susp_bin_min_front = [0.01] * 20 + [1.0] * 4           # widespread bottoming
+    s.susp_bin_min_rear = [1.0] * 24
+    batch = rules.analyze_batch(s, Tune(), "road", None, max_search=1, limits=CarLimits())
+    groups = {r.group for r in batch}
+    check("#4 bottoming batch contains the ride-height evidence change",
+          "ride_height" in groups)
+    check("#4 an unrelated ARB/damping SEARCH is NOT bundled with the bottoming batch",
+          not (groups & rules._SEARCH_GROUPS))
+    # control: with NO bottoming, the ARB search IS allowed to appear
+    s.susp_min_front = 0.6; s.susp_bin_min_front = [0.6] * 24
+    batch2 = rules.analyze_batch(s, Tune(), "road", None, max_search=1, limits=CarLimits())
+    check("#4 control: without bottoming, the ARB search change can appear",
+          any(r.group in rules._SEARCH_GROUPS for r in batch2))
+
+    # ---- #5: fastest CLEAN lap driven tracked + surfaced separate from confirmed best ----
+    c3 = C.Controller(); c3.identity = ident; c3.apply_setup("road", CarLimits())
+    c3.mode = C.MODE_AUTO; c3.laps_per_test = 3      # so _collect_lap won't finalize early
+    pk = [parse(simulator._build_packet(simulator.frame(x / 10.0, "rivals"))) for x in range(30)]
+
+    class _Lap:
+        def __init__(self, t):
+            self.last_lap_s = t; self.packets = pk; self.lap_number = 1
+    c3._collect_lap(_Lap(46.21))
+    check("#5 fastest lap driven recorded from a measured lap", c3._fastest_lap_driven == 46.21)
+    c3._collect_lap(_Lap(48.0))
+    check("#5 a SLOWER subsequent lap does not replace the fastest driven",
+          c3._fastest_lap_driven == 46.21)
+    c3.best_segment = 47.29
+    st = c3.status()
+    check("#5 status surfaces fastest-lap-driven distinct from the confirmed best",
+          st["fastest_lap_driven_s"] == 46.21 and st["best_segment_s"] == 47.29)
+    check("#5 progress_state also exposes the fastest lap driven",
+          c3.progress_state()["fastest_lap_driven_s"] == 46.21)
+
+
 def test_install_telemetry_v0117():
     print("\n== install bug: 0.0.0.0 bind captures loopback + 'no packets -> firewall' diag ==")
     import socket, time as _t
@@ -2753,6 +3061,9 @@ if __name__ == "__main__":
     test_logging_v0114()
     test_richer_channels_v0115()
     test_recalibration_v0116()
+    test_session_fixes_v0118()
+    test_v0119_shutdown_units_compound_detection()
+    test_v0120_detection_pause_resilience()
     test_install_telemetry_v0117()
     test_batch_changes()
     test_multi_lap_fitness()

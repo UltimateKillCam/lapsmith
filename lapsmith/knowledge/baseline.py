@@ -92,20 +92,33 @@ def class_target_label(letter_or_class: str) -> str:
     return f"{c} {PI_CEILING[c]}"
 
 
-def _compound(discipline: str) -> str:
+# The compound the user CAN set in FH6's build/upgrade menu (we never read it from
+# telemetry - it isn't in the packet - so the user picks it; default "Unspecified").
+COMPOUNDS = ["Unspecified", "Stock", "Street", "Sport", "Semi-Slick", "Slick",
+             "Drag", "Drift", "Rally", "Offroad", "Snow"]
+COMPOUND_UNSET = "Unspecified"
+
+
+def _compound_suggestion(discipline: str) -> str:
+    """A SUGGESTED compound by discipline, shown only as the setup dropdown's hint -
+    NOT asserted as fact. The user confirms or changes it."""
     return {
         "road": "Slick", "touge": "Slick", "topspeed": "Slick",
         "dirt": "Offroad", "cc": "Offroad", "drag": "Drag",
-    }.get(discipline, "Slick")
+    }.get(discipline, COMPOUND_UNSET)
 
 
 def build_baseline(car: str, car_class: str, discipline: str,
                    front_weight_pct: float, drivetrain: str = "AWD",
-                   limits: CarLimits | None = None) -> Tune:
+                   limits: CarLimits | None = None, compound: str | None = None) -> Tune:
     """Return an exact starting Tune, clamped to the car's achievable ranges.
 
     If `limits` carries the car's ride-height/spring slider ends, those baselines
     are computed RANGE-RELATIVE; otherwise hardcoded cm/kgf-mm starts are used.
+
+    `compound` is the USER's tyre-compound choice (it is NOT in telemetry). When given
+    it is used verbatim (incl. "Unspecified"); when None we fall back to the discipline
+    suggestion for backward compatibility (CLI), never to a blanket "Slick".
     """
     cls = canon_class(car_class)
     disc = canon_discipline(discipline)
@@ -114,7 +127,7 @@ def build_baseline(car: str, car_class: str, discipline: str,
     front_heavy = front_weight_pct >= 55.0
 
     t = Tune()
-    t.tyre_compound = _compound(disc)
+    t.tyre_compound = compound if compound else _compound_suggestion(disc)
     t.caster = 7.0  # VERIFIED
 
     # --- pressure (VERIFIED bands) ---
@@ -294,11 +307,34 @@ FIELD_LABELS = {
 }
 
 
+PSI_PER_BAR = 14.5038       # 1 bar = 14.5038 psi (exact-ish)
+
+
+def fmt_pressure(psi: float, unit: str = "psi") -> str:
+    """Tyre pressure for DISPLAY in the user's unit. Internal state + the optn.club
+    share block stay in psi (FH6's default and the share-key spec); ONLY the readout
+    converts, so tuning logic is never affected. bar gets an extra decimal because the
+    game's bar menu only shows one (the whole reason for this setting)."""
+    if unit == "bar":
+        return f"{psi / PSI_PER_BAR:.2f} bar"
+    return f"{psi:.1f} psi"
+
+
+def pressure_to_psi(value: float, unit: str = "psi") -> float:
+    """Convert a user-entered pressure (in their unit) back to canonical psi."""
+    return value * PSI_PER_BAR if unit == "bar" else value
+
+
 def field_label(field: str) -> str:
     return FIELD_LABELS.get(field, (field, "{}"))[0]
 
 
-def fmt_field(field: str, value) -> str:
+def fmt_field(field: str, value, pressure_unit: str = "psi") -> str:
+    if field in ("pressure_f", "pressure_r"):
+        try:
+            return fmt_pressure(float(value), pressure_unit)
+        except (ValueError, TypeError):
+            return str(value)
     fmt = FIELD_LABELS.get(field, (field, "{}"))[1]
     try:
         return fmt.format(value)
@@ -307,7 +343,8 @@ def fmt_field(field: str, value) -> str:
 
 
 def format_checklist(t: Tune, car: str, car_class: str, discipline: str,
-                     front_weight_pct: float, drivetrain: str) -> str:
+                     front_weight_pct: float, drivetrain: str,
+                     pressure_unit: str = "psi") -> str:
     cls = canon_class(car_class)
     disc = canon_discipline(discipline)
     pi = PI_CEILING[cls]
@@ -319,8 +356,8 @@ def format_checklist(t: Tune, car: str, car_class: str, discipline: str,
     L.append("")
     L.append("TYRES")
     L.append(f"  Compound .............. {t.tyre_compound}")
-    L.append(f"  Pressure  Front ....... {t.pressure_f:.1f} psi")
-    L.append(f"  Pressure  Rear ........ {t.pressure_r:.1f} psi")
+    L.append(f"  Pressure  Front ....... {fmt_pressure(t.pressure_f, pressure_unit)}")
+    L.append(f"  Pressure  Rear ........ {fmt_pressure(t.pressure_r, pressure_unit)}")
     L.append("ALIGNMENT")
     L.append(f"  Camber    Front ....... {t.camber_f:+.1f} deg")
     L.append(f"  Camber    Rear ........ {t.camber_r:+.1f} deg")

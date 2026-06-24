@@ -281,7 +281,19 @@ def rapidocr_read_image(path: str, udp_temps: Optional[Dict[str, float]] = None
             tokens.append((str(text), _box_center(box)))
         except Exception:
             continue
-    return tokens_to_reading(tokens, udp_temps)
+    reading = tokens_to_reading(tokens, udp_temps)
+    if reading is None:
+        # Diagnostic for "0 temp tokens": did RapidOCR see NO text (overlay not in the
+        # captured frame / wrong capture) or LOTS of text but none parsed as temps (the
+        # temp page wasn't up, or a number-format issue)? The distinction tells a user
+        # whether to fix capture vs make sure the tyre-temp page is actually showing.
+        nums = _temp_tokens(tokens)
+        sample = [t[0] for t in tokens[:8]]
+        log.warning("RapidOCR: %d text tokens detected, %d looked like temps "
+                    "(need >=12). Sample: %s%s", len(tokens), len(nums), sample,
+                    " <- no text at all: the tyre-temp page is likely not in the "
+                    "captured frame" if not tokens else "")
+    return reading
 
 
 # === OPT-IN reader: vision model via Anthropic API (off by default) ==========

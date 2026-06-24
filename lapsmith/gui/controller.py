@@ -71,6 +71,10 @@ TELEMETRY_NODATA_WARN_S = 10.0
 class Controller:
     port: int = 5607
     front_weight_pct: float = 50.0
+    pressure_unit: str = "psi"             # how tyre pressures are DISPLAYED (psi/bar)
+    tyre_compound: str = "Unspecified"     # user-set (not in telemetry); never asserted
+    _last_seen_ordinal: int = 0            # last CarOrdinal cached from a live frame
+    _car_change_pending: Optional[dict] = None   # mid-session swap awaiting re-setup prompt
     listener: Optional[TelemetryListener] = None
 
     phase: str = WAIT_TELEMETRY
@@ -91,6 +95,11 @@ class Controller:
         return self.batch[0] if self.batch else None
 
     best_segment: Optional[float] = None
+    # #5: the fastest CLEAN lap actually DRIVEN this session (informational), tracked
+    # separately from best_segment (the confirmed-tune reference used for decisions). A
+    # quick lap turned during a reverted-change test still counts here, so the displayed
+    # "fastest lap" is never slower than a lap the user just drove.
+    _fastest_lap_driven: Optional[float] = None
     _baseline_lap_s: Optional[float] = None      # the original baseline reference time
     ref_distance: Optional[float] = None
     _seg_start: Optional[segment.Mark] = None
@@ -176,6 +185,9 @@ class Controller:
     _confirmed_gains: int = 0          # changes that really lowered the best lap
     _recent_outcomes: list = field(default_factory=list)   # last few: gain/revert/discount/reject
     _rejected_fields: set = field(default_factory=set)      # user-rejected levers (whole session)
+    # #3: per-field set of EXACT values already tried-and-reverted, so we never re-propose
+    # the identical failed change (e.g. diff_rear_decel 15->10, revert, then 15->10 again).
+    _tried_values: dict = field(default_factory=dict)
     _aba_saved: int = 0                # A/B/A re-tests SKIPPED thanks to driver-input discounting
     # The BEST CONFIRMED tune (what gets SAVED) - tracked separately from state.current,
     # which drifts during reverts/A-B-A. Guarantees the saved tune is never a mid-flight
@@ -349,30 +361,106 @@ class Controller:
         return best
 
     # ---- phase 1: detect & confirm car ----------------------------------
-    def poll_identity(self) -> Optional[CarIdentity]:
-        pkt = self._best_moving_packet()
-        if is_live(pkt):
-            self.identity = identify(pkt)
+    def telemetry_live(self, within_s: float = 2.0) -> bool:
+        """Is the stream ARRIVING right now (vs paused on focus-loss)? Forza pauses
+        Data Out whenever it loses focus, so a recent frame = live; a growing age =
+        paused. Used to separate a real CAR CHANGE (act only on a fresh frame) from a
+        mere pause (keep the last-seen car)."""
+        age = self.packet_age_s()
+        return age is not None and age <= within_s
+
+    def track_identity(self) -> Optional[CarIdentity]:
+        """Continuously CACHE the car identity from telemetry, called every tick in
+        EVERY phase. The car (CarOrdinal/Class/PI/Drivetrain) is in every frame.
+
+        Persistence rule: NEVER clear a good detection just because the stream went
+        quiet (the user alt-tabbed / the game paused) - the last-seen car is retained
+        so they can set up and read the overlay with the game out of focus.
+
+        Change rule: only RE-detect from a CURRENTLY-LIVE frame. A live frame with a
+        DIFFERENT CarOrdinal is a genuine car change; the SAME ordinal after a pause is
+        the same car. A frozen frame never drives a re-detect (or a measurement)."""
+        snap = self.snapshot()
+        if snap is None or snap.car_ordinal <= 0:
+            return self.identity                 # nothing valid yet / keep last-seen
+        if self.identity is None:
+            # FIRST detection: accept the last-seen valid frame even if the stream has
+            # since paused (the car genuinely WAS seen) - so a brief flicker of
+            # telemetry is enough; no need to keep the game focused while we read it.
+            self.identity = identify(snap)
+            self._last_seen_ordinal = snap.car_ordinal
+            self.log(f"Car detected: {self.identity.name} (ordinal {self.identity.ordinal}, "
+                     f"{self.identity.drivetrain}).")
             if self.phase == WAIT_TELEMETRY:
                 self.phase = CONFIRM_CAR
             return self.identity
-        return None
+        if not self.telemetry_live():
+            return self.identity                 # paused -> keep the detected car as-is
+        if snap.car_ordinal != self.identity.ordinal:
+            old = self.identity.name
+            new = identify(snap)                 # genuine CAR CHANGE on a live frame
+            self.identity = new
+            self._last_seen_ordinal = snap.car_ordinal
+            if self._session_active():
+                # Mid-session swap: the baseline + tune belong to the OLD car. Don't
+                # silently tune the new car with stale settings - flag a re-setup prompt.
+                self._car_change_pending = {"old": old, "new": new.name,
+                                            "ordinal": new.ordinal}
+                self.log(f"Car CHANGED MID-SESSION: {old} -> {new.name} (ordinal "
+                         f"{new.ordinal}) - prompting to set up again for the new car.")
+            else:
+                self.log(f"Car CHANGED: {old} -> {new.name} (ordinal "
+                         f"{new.ordinal}) - re-detecting.")
+        elif snap.drivetrain_type != self.identity.drivetrain_raw:
+            new = identify(snap)                 # same car, drivetrain swap (e.g. AWD conv)
+            self.log(f"Drivetrain now {new.drivetrain} (raw {new.drivetrain_raw}, "
+                     f"NumCylinders {new.num_cylinders}).")
+            self.identity = new
+        return self.identity
+
+    def poll_identity(self) -> Optional[CarIdentity]:
+        """Back-compat entry (START TUNING + the WAIT_TELEMETRY pump): delegates to the
+        continuous cache, which detects even at a standstill / across a pause."""
+        return self.track_identity()
+
+    def detection_state(self) -> dict:
+        """Plain, unambiguous read on WHERE detection is - never reverts a good
+        detection to 'no car' just because the stream went quiet:
+          car_detected (live) / car_detected (paused - fine) / telemetry_no_car / no_telemetry."""
+        if self.identity is not None:
+            if self.telemetry_live():
+                return {"state": "car_detected", "live": True,
+                        "message": f"Detected: {self.identity.name}."}
+            return {"state": "car_detected", "live": False,
+                    "message": (f"Detected: {self.identity.name} (telemetry paused - "
+                                "that's fine, it's just the game losing focus).")}
+        pc = getattr(self.listener, "packet_count", 0) if self.listener else 0
+        if pc == 0:
+            return {"state": "no_telemetry", "live": False,
+                    "message": (self.telemetry_diagnostic()
+                                or f"Waiting for telemetry on port {self.port} - start "
+                                   "driving in FH6 with Data Out on.")}
+        return {"state": "telemetry_no_car", "live": self.telemetry_live(),
+                "message": "No car seen yet - drive briefly with Forza in focus."}
 
     def refresh_identity(self):
-        """Re-read DrivetrainType (and the rest of the car-info block) from the
-        LATEST live frame, so a swapped drivetrain (e.g. an AWD conversion) is
-        reflected - it's not detected once at startup. Logs the raw value on any
-        change so a misdetect is traceable."""
-        snap = self.snapshot()
-        if not is_live(snap) or self.identity is None:
-            return
-        if snap.drivetrain_type != self.identity.drivetrain_raw \
-                or snap.car_ordinal != self.identity.ordinal:
-            new = identify(snap)
-            if new.drivetrain != self.identity.drivetrain:
-                self.log(f"Drivetrain now {new.drivetrain} (raw {new.drivetrain_raw}, "
-                         f"NumCylinders {new.num_cylinders}).")
-            self.identity = new
+        """Per-tick identity upkeep for the non-WAIT phases: same continuous cache, so
+        a car change or drivetrain swap mid-session is picked up from live frames while
+        a pause never disturbs the detected car."""
+        self.track_identity()
+
+    def _session_active(self) -> bool:
+        """True when a tune is actually in progress (baseline applied / driving), so a
+        car change should prompt a re-setup rather than be a silent pre-setup re-detect."""
+        return self.baseline is not None and self.phase in (
+            APPLY_BASELINE, DRIVE_AUTO, SHOW_CHANGE)
+
+    def pending_car_change(self) -> Optional[dict]:
+        """A mid-session car swap awaiting the user's 'set up again?' decision, or None."""
+        return self._car_change_pending
+
+    def clear_car_change(self) -> None:
+        self._car_change_pending = None
 
     def needs_car_name(self) -> bool:
         """True when the detected ordinal has no friendly name yet (new/updated
@@ -396,6 +484,8 @@ class Controller:
         and tunes many cars). Keeps identity/listener; setup rebuilds the baseline.
         Does not change any saved file - only in-memory state."""
         self.best_segment = None
+        self._fastest_lap_driven = None
+        self._car_change_pending = None
         self._baseline_lap_s = None
         self.mode = None
         self._watcher.reset()
@@ -441,6 +531,7 @@ class Controller:
         self._confirmed_gains = 0
         self._recent_outcomes = []
         self._rejected_fields = set()
+        self._tried_values = {}
         self._aba_saved = 0
         self._best_tune = None
         self._best_tune_lap = None
@@ -479,7 +570,13 @@ class Controller:
                     rigour: Optional[str] = None,
                     time_budget_min: Optional[float] = None,
                     console_mode: Optional[bool] = None,
-                    drivetrain: Optional[str] = None):
+                    drivetrain: Optional[str] = None,
+                    compound: Optional[str] = None,
+                    pressure_unit: Optional[str] = None):
+        if pressure_unit in ("psi", "bar"):
+            self.pressure_unit = pressure_unit
+        if compound is not None:
+            self.tyre_compound = compound          # user's choice (may be "Unspecified")
         if console_mode is not None:
             self.set_console_mode(bool(console_mode))   # rebinds the listener if needed
         if drivetrain in ("FWD", "RWD", "AWD"):
@@ -517,7 +614,7 @@ class Controller:
         car = self.identity.name if self.identity else "Car"
         self.baseline = build_baseline(car, target, discipline,
                                        self.front_weight_pct, drivetrain,
-                                       limits=self.limits)
+                                       limits=self.limits, compound=self.tyre_compound)
         self.state = TuneState(self.baseline.copy())
         self.phase = APPLY_BASELINE
         # best CONFIRMED tune starts as the baseline (no confirmed gain yet)
@@ -546,7 +643,8 @@ class Controller:
         return format_checklist(self.baseline, ident.name if ident else "Car",
                                 target,
                                 self.discipline, self.front_weight_pct,
-                                self.effective_drivetrain())
+                                self.effective_drivetrain(),
+                                pressure_unit=self.pressure_unit)
 
     def baseline_applied(self):
         """User entered the baseline. Mode is NOT locked here - it stays
@@ -723,6 +821,11 @@ class Controller:
         The BEST lap supplies the diagnostic telemetry + Heat reading."""
         t = lap.last_lap_s
         self._test_laps.append(t)
+        # #5: record the fastest clean lap actually driven (any test, kept or reverted).
+        if t and t > 0 and (self._fastest_lap_driven is None or t < self._fastest_lap_driven):
+            self._fastest_lap_driven = t
+            _laplog.info("FASTEST LAP DRIVEN this session: %.2fs (informational; tune "
+                         "decisions still use the confirmed-gain logic).", t)
         self._test_packets.extend(lap.packets)   # for track-position telemetry binning
         stats = aggregate(lap.packets)
         self._read_lap_heat()                  # per-lap Heat (resets the capture)
@@ -759,7 +862,8 @@ class Controller:
             trend = "Searching for gains"
         return {"confirmed_gains": self._confirmed_gains, "best_s": best,
                 "start_s": start, "delta_vs_start_s": delta, "trend": trend,
-                "aba_saved": self._aba_saved}
+                "aba_saved": self._aba_saved,
+                "fastest_lap_driven_s": self._fastest_lap_driven}
 
     def reject_change(self):
         """User rejects the proposed change ([F10]/overlay): DON'T apply it, LOCK those
@@ -809,8 +913,11 @@ class Controller:
         disc = self.discipline.lower()
         if "dirt" in disc or "cross" in disc or disc in ("cc", "drag"):
             return False
+        # "udp_single" still means the on-screen Heat page wasn't read, so CAMBER/toe
+        # are tuned blind (UDP gives only one temp per corner, no inner/outer zones) -
+        # treat it as temp-blind too, even though pressure/balance do use the UDP temps.
         return (self.tyre_reading is None
-                and self.last_reader in (None, "", "none", "camber_search"))
+                and self.last_reader in (None, "", "none", "camber_search", "udp_single"))
 
     def _warn_temp_blind_once(self):
         """Log the no-temp-reader warning prominently ONCE per session (after we're
@@ -891,7 +998,8 @@ class Controller:
                 differs = frm != to
             if differs:
                 out.append({"field": fld, "label": field_label(fld),
-                            "from": fmt_field(fld, frm), "to": fmt_field(fld, to)})
+                            "from": fmt_field(fld, frm, self.pressure_unit),
+                            "to": fmt_field(fld, to, self.pressure_unit)})
         return out
 
     def ui_state(self) -> dict:
@@ -1140,6 +1248,10 @@ class Controller:
     def _revert_batch(self):
         for r in reversed(self._applied_records):
             for k, v in r.previous.items():
+                # #3: remember the EXACT value we just tried so it isn't re-proposed.
+                tried = self.state.current.get(k)
+                if tried is not None:
+                    self._tried_values.setdefault(k, set()).add(round(float(tried), 2))
                 self.state.current.set(k, v)
                 self._on_car[k] = v          # gate-revert: the car returns to the previous
                                              # value, so on-car tracks it (no phantom revert
@@ -1634,11 +1746,22 @@ class Controller:
                 self.last_reader = "tesseract"
                 self.log("[heat] Tesseract OCR read the frame (UDP-checked).")
         if reading is None:
-            # Never block on manual: fall through with no reading and let the
-            # tuner search camber by lap time this iteration.
-            self.last_reader = "camber_search"
-            self.log("[heat] no clean OCR read - tuning camber by LAP-TIME SEARCH "
-                     "this lap (press the manual hotkey to enter temps if you prefer).")
+            # #2: OCR found no 3-zone temps. If the UDP packet carries per-corner
+            # temps, use THOSE for pressure/balance (they already feed the pressure &
+            # ARB rules via stats) rather than treating the car as fully temp-blind and
+            # falling straight to a blind lap-time search. Camber needs the inner/mid/
+            # outer ZONES that only the on-screen temp page gives, so it stays on
+            # lap-time search - but log the REAL path so it's not mistaken for "no temps".
+            has_udp = bool(udp_temps) and any(v for v in (udp_temps or {}).values())
+            if has_udp:
+                self.last_reader = "udp_single"
+                self.log("[heat] OCR found no 3-zone temps - using per-corner UDP temps "
+                         "for pressure/balance; camber by lap-time search (zones need "
+                         "the on-screen temp page).")
+            else:
+                self.last_reader = "camber_search"
+                self.log("[heat] no OCR read and no UDP temps - tuning camber by LAP-TIME "
+                         "SEARCH this lap (press the manual hotkey to enter temps).")
         self.tyre_reading = reading
 
     def _apply_fitness(self, after: Optional[float]):
@@ -1749,7 +1872,8 @@ class Controller:
             step_mult=rules.step_mult_for(self.aggressiveness),
             bottoming_attempts=self._bottoming_attempts,
             lever_locked=self._lever_locked,
-            rejected_fields=self._rejected_fields)
+            rejected_fields=self._rejected_fields,
+            tried_values=self._tried_values)
         if not self.batch:
             if self.stale >= 2 or self.best_segment is None:
                 self.phase = DONE
@@ -1881,7 +2005,7 @@ class Controller:
             self.export = store.export_tune(
                 self.state, car=m["car"], car_class=m["car_class"], discipline=self.discipline,
                 front_weight_pct=self.front_weight_pct, drivetrain=m["drivetrain"],
-                best_lap_s=best_lap, final_tune=out)
+                best_lap_s=best_lap, final_tune=out, pressure_unit=self.pressure_unit)
             try:
                 store.append_cumulative_log(
                     self.state, self.baseline, car=m["car"], car_class=m["car_class"],
@@ -1972,12 +2096,9 @@ class Controller:
         auto = mode == MODE_AUTO
         # 1. SELECT CAR
         if ph == WAIT_TELEMETRY:
-            diag = self.telemetry_diagnostic()       # bound but no packets -> firewall hint
-            if diag:
-                return self._g(1, "Select car", diag)
-            return self._g(1, "Select car",
-                           f"Start driving in FH6 (Data Out on, port {port}) - "
-                           "waiting for telemetry.")
+            # Plain detection state: no-telemetry (firewall/Data-Out) vs telemetry-but-
+            # no-car. Either way the message says exactly what to do, no guessing.
+            return self._g(1, "Select car", self.detection_state()["message"])
         if ph == CONFIRM_CAR:
             name = self.identity.name if self.identity else "the car"
             return self._g(1, "Select car",
@@ -2100,8 +2221,9 @@ class Controller:
 
     # ---- view model ------------------------------------------------------
     def packet_age_s(self) -> Optional[float]:
-        if self.listener and self.listener.last_packet_time:
-            return round(time.time() - self.listener.last_packet_time, 1)
+        lpt = getattr(self.listener, "last_packet_time", 0) if self.listener else 0
+        if lpt:
+            return round(time.time() - lpt, 1)
         return None
 
     def status(self) -> dict:
@@ -2139,6 +2261,8 @@ class Controller:
             "port": self.port,
             "packet_age_s": self.packet_age_s(),
             "telemetry_diagnostic": self.telemetry_diagnostic(),
+            "detection": self.detection_state(),
+            "car_change_pending": self._car_change_pending,
             "error": self.error,
             "mode": self.mode,
             "mode_label": mode_label,
@@ -2149,6 +2273,7 @@ class Controller:
             "discipline": self.discipline,
             "iteration": self.state.iteration if self.state else 0,
             "best_segment_s": self.best_segment,
+            "fastest_lap_driven_s": self._fastest_lap_driven,
             "ui": self.ui_state(),
             "progress": self.progress_state(),
             "console_mode": self.console_mode,

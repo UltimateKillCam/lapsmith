@@ -269,6 +269,8 @@ def main(argv=None) -> int:
                         started_iso=_dt.datetime.now().isoformat(timespec="seconds"))
     ctrl.time_budget_min = prefs.time_budget_min()   # persisted ceiling (default 20)
     ctrl.console_mode = bool(prefs.get("console_mode", False))   # binds 0.0.0.0 if on
+    pu = prefs.get("pressure_unit", "psi")
+    ctrl.pressure_unit = pu if pu in ("psi", "bar") else "psi"   # how pressures display
     ctrl.persist = True                              # enable disk writes (logs/history)
     try:
         ctrl.start()
@@ -336,6 +338,7 @@ def main(argv=None) -> int:
     auto_box = {"cap": None}                  # AUTO continuous per-lap capture
     busy = {"flag": False}     # reentrancy guard (the setup dialog runs a nested loop)
     done_box = {"bundled": False}             # write the support zip once on completion
+    car_change_box = {"open": False}          # guard the mid-session car-change prompt
 
     def current_frames():
         frames = []
@@ -384,6 +387,13 @@ def main(argv=None) -> int:
         log.info("clean quit - exiting")
         _shutdown()            # save session + release UDP 5607 NOW, before unwinding
         app.quit()
+        # Watchdog: if app.quit() can't unwind (e.g. the X was hit while the modal
+        # setup dialog's nested event loop is running, so app.exec() never returns),
+        # force-terminate anyway. Resources are already released by _shutdown().
+        try:
+            QtCore.QTimer.singleShot(700, lambda: (logging.shutdown(), os._exit(0)))
+        except Exception:
+            os._exit(0)
 
     # belt-and-suspenders: run the same clean shutdown even on an unexpected exit, so
     # the UDP socket is freed and an in-progress session is saved no matter what.
@@ -521,7 +531,9 @@ def main(argv=None) -> int:
                              rigour=res.get("rigour"),
                              time_budget_min=res.get("time_budget_min"),
                              console_mode=res.get("console_mode"),
-                             drivetrain=res.get("drivetrain"))
+                             drivetrain=res.get("drivetrain"),
+                             compound=res.get("compound"),
+                             pressure_unit=prefs.get("pressure_unit", "psi"))
             done_box["bundled"] = False
             log.info("setup applied: %s -> phase=%s",
                      {k: v for k, v in res.items() if k != "limits"}, ctrl.phase)
@@ -593,6 +605,28 @@ def main(argv=None) -> int:
                 ctrl.poll_identity()
             else:
                 ctrl.refresh_identity()   # re-read DrivetrainType etc. every tick
+            # Mid-session CAR CHANGE: the live car differs from the one this session was
+            # set up for. The baseline/tune are for the old car, so offer a re-setup.
+            pend = ctrl.pending_car_change()
+            if pend and not car_change_box["open"] and not busy["flag"]:
+                car_change_box["open"] = True
+                ctrl.clear_car_change()       # consume so it prompts once per change
+                try:
+                    resp = QtWidgets.QMessageBox.question(
+                        window, "Car changed",
+                        f"A different car is now detected: {pend['new']}\n"
+                        f"(this session is set up for {pend['old']}).\n\n"
+                        "Set up tuning for the new car?",
+                        QtWidgets.QMessageBox.StandardButton.Yes
+                        | QtWidgets.QMessageBox.StandardButton.No)
+                    if resp == QtWidgets.QMessageBox.StandardButton.Yes:
+                        log.info("car change: user chose to re-setup for %s", pend["new"])
+                        hooks["start_tuning"]()
+                    else:
+                        ctrl.log(f"[car change] continuing the existing {pend['old']} "
+                                 "session (you can press START TUNING for the new car).")
+                finally:
+                    car_change_box["open"] = False
             # AUTO-LAP: while DRIVING (detecting OR auto) start the continuous
             # per-lap Heat capture and run the lap detector each tick. (The bug:
             # tick() only ran once mode was AUTO, but mode only flips INSIDE tick -
@@ -689,7 +723,15 @@ def main(argv=None) -> int:
     finally:
         _shutdown()            # idempotent - no-op if tray Quit already ran it
         log.info("shutdown complete")
-    return rc
+    # HARD EXIT (the recurring "won't close / holds the port" fix): RapidOCR's
+    # onnxruntime, OpenCV (cv2.pyd) and the global keyboard hook spin up NATIVE threads
+    # that are NOT Python daemon threads, so once main() returns the interpreter blocks
+    # waiting on them and the process lingers (zombie that even taskkill can't end and
+    # keeps UDP 5607 bound). _shutdown() has already closed the socket and flushed the
+    # session, so terminate immediately rather than wait.
+    log.info("forcing process termination to release all OS resources")
+    logging.shutdown()
+    os._exit(rc if isinstance(rc, int) else 0)
 
 
 if __name__ == "__main__":
