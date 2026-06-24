@@ -294,6 +294,11 @@ def _render_tune(st: dict) -> str:
     if st.get("error"):
         P.append("<div style='color:#ff6b6b;font-weight:700;margin:2px 0'>"
                  f"&#9888; ERROR: {_esc(str(st['error']))}</div>")
+    # persistent NO-TEMP-READER warning: camber/toe tuned blind on tarmac
+    if st.get("temp_blind"):
+        P.append("<div style='font-size:12px;font-weight:800;color:#0c0e12;background:#ff8a4c;"
+                 "border-radius:5px;padding:5px 8px;margin:3px 0'>&#9888; NO TYRE TEMPS - "
+                 "camber/toe tuned BLIND. Show the in-game Heat page on a cornering lap.</div>")
     # persistent console-mode notice: camber/toe less accurate (single tyre temp)
     if st.get("console_mode"):
         ipnote = (f" &nbsp;|&nbsp; console &#8594; this PC {_esc(st['lan_ip'])}:"

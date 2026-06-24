@@ -18,7 +18,14 @@
 #define MyAppName "LapSmith"
 #define MyAppExeName "LapSmith.exe"
 #define MyAppPublisher "LapSmith"
-#define MyAppDist "..\dist\LapSmith"
+; Overridable with /DMyAppDist=... and /DMyAppOut=... so the installer can be built
+; from an alternate dist folder (e.g. when the default one is locked).
+#ifndef MyAppDist
+  #define MyAppDist "..\dist\LapSmith"
+#endif
+#ifndef MyAppOut
+  #define MyAppOut "..\dist"
+#endif
 #define MyAppIcon "..\lapsmith\assets\lapsmith.ico"
 #define MyAppNotices "..\THIRD-PARTY-NOTICES.txt"
 
@@ -34,7 +41,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
-OutputDir=..\dist
+OutputDir={#MyAppOut}
 OutputBaseFilename=LapSmith-Setup
 Compression=lzma2
 SolidCompression=yes

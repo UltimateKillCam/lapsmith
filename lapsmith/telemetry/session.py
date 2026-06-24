@@ -52,6 +52,30 @@ class TestStats:
     on_throttle_rear_slip: float = 0.0
     braking_rear_slip: float = 0.0
 
+    # PER-WHEEL detail (corner that locks/spins worst) - sharper than the axle average.
+    power_spin_wheel: str = ""        # driven wheel spinning most on throttle (FL/FR/RL/RR)
+    power_spin_slip: float = 0.0      # its slip ratio
+    brake_lock_wheel: str = ""        # wheel locking most under braking
+    brake_lock_slip: float = 0.0      # its (most negative) slip ratio magnitude
+    brake_lock_confirmed: bool = False  # WheelRotationSpeed ~0 while moving (true lockup)
+
+    # suspension BALANCE (from per-corner normalized travel in the corner window)
+    susp_min_fl: float = 1.0
+    susp_min_fr: float = 1.0
+    susp_min_rl: float = 1.0
+    susp_min_rr: float = 1.0
+    pitch_bias: float = 0.0           # front avg compression - rear (neg = nose dives more)
+    roll_asym_front: float = 0.0      # |FL-FR| compression in corners (body roll, front)
+    roll_asym_rear: float = 0.0       # |RL-RR| compression in corners (body roll, rear)
+
+    vert_g_rms: float = 0.0           # vertical-accel RMS (ride harshness)
+
+    # which richer channels carried signal this measurement (graceful-degrade flags)
+    chan_wheel_rotation: bool = False
+    chan_vertical_accel: bool = False
+    chan_per_wheel_slip: bool = False
+    chan_suspension: bool = False
+
     # combined slip (greasy detection) per axle
     combined_slip_front: float = 0.0
     combined_slip_rear: float = 0.0
@@ -76,6 +100,14 @@ class TestStats:
             "front_avg": (self.temp_fl + self.temp_fr) / 2,
             "rear_avg": (self.temp_rl + self.temp_rr) / 2,
         }
+
+    def channels_available(self) -> dict:
+        """Which richer telemetry channels carried signal this measurement, so a rule
+        can degrade gracefully and the session log can record what was live."""
+        return {"per_wheel_slip": self.chan_per_wheel_slip,
+                "wheel_rotation": self.chan_wheel_rotation,
+                "suspension": self.chan_suspension,
+                "vertical_accel": self.chan_vertical_accel}
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -127,6 +159,59 @@ def aggregate(packets: List[Packet]) -> TestStats:
     braking = [p for p in moving if p.brake >= BRAKE_ON]
     if braking:
         s.braking_rear_slip = _avg([(abs(p.tire_slip_ratio_rl) + abs(p.tire_slip_ratio_rr)) / 2 for p in braking])
+
+    # ---- PER-WHEEL detail: which CORNER spins/locks worst (sharper than the axle
+    # average), so a decision and its "why" can name the wheel. -------------------
+    _WHEELS = (("FL", "tire_slip_ratio_fl", "wheel_rot_fl"),
+               ("FR", "tire_slip_ratio_fr", "wheel_rot_fr"),
+               ("RL", "tire_slip_ratio_rl", "wheel_rot_rl"),
+               ("RR", "tire_slip_ratio_rr", "wheel_rot_rr"))
+    s.chan_per_wheel_slip = any(abs(getattr(p, sr)) > 1e-4 for p in moving
+                                for _, sr, _ in _WHEELS)
+    s.chan_wheel_rotation = any(abs(getattr(p, wr)) > 1e-4 for p in moving
+                                for _, _, wr in _WHEELS)
+    drivetrain_wheels = {"FWD": ("FL", "FR"), "RWD": ("RL", "RR")}.get(
+        s.drivetrain, ("FL", "FR", "RL", "RR"))
+    if on_throttle and s.chan_per_wheel_slip:      # worst-spinning DRIVEN wheel on power
+        best = ("", 0.0)
+        for name, sr, _ in _WHEELS:
+            if name not in drivetrain_wheels:
+                continue
+            v = _avg([max(0.0, getattr(p, sr)) for p in on_throttle])
+            if v > best[1]:
+                best = (name, v)
+        s.power_spin_wheel, s.power_spin_slip = best
+    if braking and s.chan_per_wheel_slip:          # wheel locking most under braking
+        worst = ("", 0.0)
+        for name, sr, wr in _WHEELS:
+            lock = _avg([max(0.0, -getattr(p, sr)) for p in braking])  # negative slip = locking
+            if lock > worst[1]:
+                worst = (name, lock)
+        s.brake_lock_wheel, s.brake_lock_slip = worst
+        if s.chan_wheel_rotation and s.brake_lock_wheel:        # rotation ~0 while moving
+            wr = dict((n, w) for n, _, w in _WHEELS)[s.brake_lock_wheel]
+            s.brake_lock_confirmed = any(
+                abs(getattr(p, wr)) < 1.0 and p.speed > 5.0 for p in braking)
+
+    # ---- suspension BALANCE (per-corner compression in the corner window) --------
+    if corner and any(p.susp_norm_fl or p.susp_norm_fr or p.susp_norm_rl or p.susp_norm_rr
+                      for p in corner):
+        s.chan_suspension = True
+        s.susp_min_fl = min(p.susp_norm_fl for p in corner)
+        s.susp_min_fr = min(p.susp_norm_fr for p in corner)
+        s.susp_min_rl = min(p.susp_norm_rl for p in corner)
+        s.susp_min_rr = min(p.susp_norm_rr for p in corner)
+        front_c = _avg([(p.susp_norm_fl + p.susp_norm_fr) / 2 for p in corner])
+        rear_c = _avg([(p.susp_norm_rl + p.susp_norm_rr) / 2 for p in corner])
+        s.pitch_bias = front_c - rear_c            # < 0 = front compresses more (soft front)
+        s.roll_asym_front = _avg([abs(p.susp_norm_fl - p.susp_norm_fr) for p in corner])
+        s.roll_asym_rear = _avg([abs(p.susp_norm_rl - p.susp_norm_rr) for p in corner])
+
+    # ---- vertical-accel RMS (ride harshness) -------------------------------------
+    vert = [p.accel_y / 9.80665 for p in moving]
+    if any(abs(v) > 1e-3 for v in vert):
+        s.chan_vertical_accel = True
+        s.vert_g_rms = (sum(v * v for v in vert) / len(vert)) ** 0.5
 
     s.max_rpm_seen = max((p.current_engine_rpm for p in moving), default=0.0)
     s.top_speed_ms = max((p.speed for p in moving), default=0.0)

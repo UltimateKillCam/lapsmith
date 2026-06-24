@@ -85,20 +85,49 @@ def _set_app_user_model_id() -> None:
 
 
 def setup_logging() -> str:
+    from logging.handlers import RotatingFileHandler
     logfile = os.path.join(_log_dir(), "app.log")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    for h in (logging.FileHandler(logfile, encoding="utf-8"),
-              logging.StreamHandler(sys.stdout)):
+    # app.log is the DECISION log: rotate it so it stays bounded yet retains the full
+    # recent session(s). With raw telemetry split out (below) it's small + readable.
+    fh = RotatingFileHandler(logfile, maxBytes=4_000_000, backupCount=4, encoding="utf-8")
+    for h in (fh, logging.StreamHandler(sys.stdout)):
         h.setFormatter(fmt)
         root.addHandler(h)
+    # HIGH-FREQUENCY raw per-packet/per-tick telemetry dumps go on their OWN logger,
+    # which does NOT propagate to app.log or the support bundle. Off by default; only
+    # written to raw_telemetry.log when the "verbose telemetry logging" toggle is on.
+    raw = logging.getLogger("lapsmith.raw")
+    raw.propagate = False
+    raw.addHandler(logging.NullHandler())
 
     def _excepthook(exc_type, exc, tb):
         logging.getLogger("lapsmith").critical(
             "UNCAUGHT: %s", "".join(traceback.format_exception(exc_type, exc, tb)))
     sys.excepthook = _excepthook
     return logfile
+
+
+def configure_raw_telemetry_log(enable: bool) -> None:
+    """Attach (or detach) a separate raw_telemetry.log handler for the high-frequency
+    per-packet dumps. Default OFF: the dumps are dropped so they never bloat app.log or
+    the support bundle. The toggle persists via prefs."""
+    raw = logging.getLogger("lapsmith.raw")
+    raw.setLevel(logging.INFO)
+    # drop any existing real file handler first (idempotent)
+    for h in list(raw.handlers):
+        if isinstance(h, logging.FileHandler):
+            raw.removeHandler(h)
+            h.close()
+    if enable:
+        from logging.handlers import RotatingFileHandler
+        path = os.path.join(_log_dir(), "raw_telemetry.log")
+        h = RotatingFileHandler(path, maxBytes=8_000_000, backupCount=2, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        raw.addHandler(h)
+        log.info("verbose telemetry logging ON -> %s", path)
 
 
 class PeakHeatCapture:
@@ -224,6 +253,7 @@ def main(argv=None) -> int:
     n = ordinals.set_store_path(os.path.join(data_dir, "car_names.json"))
     store.set_sessions_dir(os.path.join(data_dir, "sessions"))
     prefs.set_store_path(os.path.join(data_dir, "prefs.json"))
+    configure_raw_telemetry_log(bool(prefs.get("verbose_telemetry", False)))  # default OFF
     capture.CAPTURE_DIR = os.path.join(data_dir, "captures")   # Heat frames under the data dir
     log.info("loaded %d saved car name(s); tunes -> %s", n, store.SESSIONS_DIR)
 

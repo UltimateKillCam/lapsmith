@@ -156,8 +156,10 @@ def show_setup_dialog(detected_summary: str = "",
     tmode.addItems(["Auto, local OCR (rec.)", "Manual entry each lap"])
     form.addRow("Tyre temps", tmode)
     form.addRow(_wrapped(
-        "<i>Auto reads temps locally (bundled OCR, offline). If a lap can't be "
-        "read it tunes camber by lap time instead - never blocks on typing.</i>"))
+        "<i>Auto reads temps locally (bundled OCR, offline). On tarmac the in-game "
+        "<b>Heat / tyre-temp page must be visible on a hard cornering lap</b> to read - "
+        "otherwise camber/toe are tuned BLIND (lap time only) and unreliable; the "
+        "overlay warns you. It never blocks on typing.</i>"))
     vapi = QtWidgets.QCheckBox("Use Anthropic vision API")
     vapi.setChecked(False)
     form.addRow("Cloud reader (optional)", vapi)

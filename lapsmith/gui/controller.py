@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
 _laplog = logging.getLogger("lapsmith.laps")
+_rawlog = logging.getLogger("lapsmith.raw")     # high-frequency per-tick/per-packet dumps
+_declog = logging.getLogger("lapsmith.session")  # user-facing decision narrative
 
 from ..telemetry.listener import TelemetryListener
 from ..telemetry.session import aggregate, TestStats, HIGH_G_THRESHOLD
@@ -176,9 +178,11 @@ class Controller:
     # reverted state (fixes "exited on baseline despite a faster confirmed tune").
     _best_tune: object = None          # Tune copy that achieved best_segment
     _best_tune_lap: Optional[float] = None
-    _session_log: object = None        # open file handle: incremental crash-safe log
+    _session_log: object = None        # per-session decision-log handler
     _saved: bool = False               # a final save has been written
     persist: bool = False              # app sets True; gates disk writes (off in tests)
+    _temp_warned: bool = False         # logged the no-temp-reader warning once
+    _channels_logged: bool = False     # logged which telemetry channels were live
     # change aggressiveness -> step multiplier (fine 0.5 / normal 1.0 / coarse 2.0).
     aggressiveness: str = "normal"
     stale: int = 0
@@ -247,41 +251,52 @@ class Controller:
     def log(self, msg: str):
         self.messages.append(msg)
         self.messages = self.messages[-50:]
-        # INCREMENTAL crash-safe session log: append + flush every line, so a session
-        # is recoverable even if the app crashes / is force-closed before finish().
-        fh = self._session_log
-        if fh is not None:
-            try:
-                fh.write(f"{_dt.datetime.now().isoformat(timespec='seconds')}  {msg}\n")
-                fh.flush()
-            except Exception:
-                self._session_log = None        # never let logging break the session
+        # Route the human narrative through the logging system so it lands in BOTH
+        # app.log and the per-session DECISION log (a logging handler, see below).
+        _declog.info(msg)
 
     def _open_session_log(self):
-        """Open (or reopen) the per-session log the moment a session meaningfully
-        starts. Errors are surfaced, not swallowed - a failed write means lost data."""
+        """Attach a per-session DECISION log: a FileHandler on the `lapsmith` parent
+        logger, so the WHOLE decision trail (proposed changes + their 'why', the
+        eligible-vs-fired rules, drivetrain detection, A/B/A, re-anchors, fixation
+        locks, the final check) is captured start-to-finish - NOT just self.log() and
+        NOT the high-frequency raw telemetry (lapsmith.raw doesn't propagate here).
+        Written incrementally + flushed per record, so it survives a crash."""
         self._close_session_log()
         try:
             m = self._meta()
             path = store.session_log_path(m["car"], self.discipline or "session")
-            self._session_log = open(path, "a", encoding="utf-8")
-            self._session_log.write(
-                f"\n===== SESSION START {self.started_iso} "
-                f"({m['car']}, {self.discipline}) =====\n")
-            self._session_log.flush()
-            _laplog.info("session log open (incremental): %s", path)
+            parent = logging.getLogger("lapsmith")
+            parent.setLevel(logging.INFO)      # ensure INFO records reach the handler
+                                               # (root may be unconfigured, e.g. in tests)
+            # remove any stray session handler from a prior controller (no leaks)
+            for old in [x for x in parent.handlers if getattr(x, "_lapsmith_session", False)]:
+                parent.removeHandler(old)
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            h = logging.FileHandler(path, encoding="utf-8")
+            h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+            h.addFilter(lambda r: not r.name.startswith("lapsmith.raw"))   # belt-and-suspenders
+            h._lapsmith_session = True
+            parent.addHandler(h)
+            self._session_log = h
+            _laplog.info("===== SESSION START %s (%s, %s) - decision log: %s =====",
+                         self.started_iso, m["car"], self.discipline, path)
         except Exception as e:
             self._session_log = None
-            _laplog.exception("could not open session log")
+            _laplog.exception("could not open session decision log")
             self.fail(f"session log could not be opened ({e}); check the sessions folder "
                       "is writable - see app.log.")
 
     def _close_session_log(self):
-        fh, self._session_log = self._session_log, None
-        if fh is not None:
+        h, self._session_log = self._session_log, None
+        if h is not None:
             try:
-                fh.write("===== SESSION LOG CLOSED =====\n")
-                fh.close()
+                _laplog.info("===== SESSION LOG CLOSED =====")
+                logging.getLogger("lapsmith").removeHandler(h)
+                h.close()
             except Exception:
                 pass
 
@@ -397,6 +412,8 @@ class Controller:
         self._best_tune_lap = None
         self._close_session_log()
         self._saved = False
+        self._temp_warned = False
+        self._channels_logged = False
         self.error = None
         self.started_iso = _dt.datetime.now().isoformat(timespec="seconds")
 
@@ -520,14 +537,14 @@ class Controller:
         self._skip_laps = 1
 
     def _instrument(self, snap):
-        """Log the raw lap fields to app.log on change (offset-verification)."""
+        """Raw lap fields (offset-verification) - HIGH FREQUENCY, kept off app.log."""
         if snap is None:
             return
         dbg = (int(snap.is_race_on), int(snap.lap_number),
                round(snap.current_lap, 1), round(snap.last_lap, 2))
         if dbg != self._lap_dbg:
             self._lap_dbg = dbg
-            _laplog.info("lap-fields RAW: IsRaceOn@0=%d LapNumber@312=%d "
+            _rawlog.info("lap-fields RAW: IsRaceOn@0=%d LapNumber@312=%d "
                          "CurrentLap@304=%.2f LastLap@300=%.2f", *dbg)
 
     def tick(self):
@@ -549,7 +566,7 @@ class Controller:
             adv = self._watcher.advancing()
             if self.mode is None:
                 last = pkts[-1] if pkts else None
-                _laplog.info("tick DETECT: n=%d prevLap=%s curLap=%s prevCur=%s "
+                _rawlog.info("tick DETECT: n=%d prevLap=%s curLap=%s prevCur=%s "
                              "curCur=%s advancing=%s completed=%d",
                              len(pkts), prev_lap,
                              (last.lap_number if last else None), prev_cur,
@@ -604,7 +621,7 @@ class Controller:
                        self._await_state)
                 if dbg != self._await_dbg:
                     self._await_dbg = dbg
-                    _laplog.info("WAITING_FOR_MEASURED_LAP[%s] tick: prevLap=%s curLap=%s "
+                    _rawlog.info("WAITING_FOR_MEASURED_LAP[%s] tick: prevLap=%s curLap=%s "
                                  "curCur=%.1f skip_laps=%d completed=%d",
                                  self._await_state, prev_lap, last.lap_number,
                                  last.current_lap, self._skip_laps, len(laps))
@@ -742,6 +759,34 @@ class Controller:
         if self.drivetrain_override in ("FWD", "RWD", "AWD"):
             return self.drivetrain_override
         return self.identity.drivetrain if self.identity else "AWD"
+
+    TEMP_BLIND_NOTICE = ("No tyre-temp reading on a tarmac run - camber/toe are being "
+                         "tuned BLIND (by lap time only) and will be unreliable. Bring up "
+                         "the in-game Heat/tyre-temp page on a hard cornering lap so it "
+                         "can read the 3-zone temps.")
+
+    def temp_blind(self) -> bool:
+        """True when tyre temps MATTER (tarmac) but no temp source is producing a
+        reading - so camber/toe are being tuned blind. Console mode has its own
+        single-temp notice; dirt/CC camber is lap-time-tuned by design."""
+        if self.console_mode or not self.discipline:
+            return False
+        disc = self.discipline.lower()
+        if "dirt" in disc or "cross" in disc or disc in ("cc", "drag"):
+            return False
+        return (self.tyre_reading is None
+                and self.last_reader in (None, "", "none", "camber_search"))
+
+    def _warn_temp_blind_once(self):
+        """Log the no-temp-reader warning prominently ONCE per session (after we're
+        actually driving), so it's plain in the decision log, not buried."""
+        if self._temp_warned or not self.temp_blind() or self.best_segment is None:
+            return
+        self._temp_warned = True
+        _laplog.warning("NO TEMP READER: tarmac run with no tyre-temp reading "
+                        "(reader=%s) - camber/toe are being tuned BLIND by lap time. %s",
+                        self.last_reader, self.TEMP_BLIND_NOTICE)
+        self.log("[temps] " + self.TEMP_BLIND_NOTICE)
 
     CONSOLE_NOTICE = ("Console mode: only ONE tyre temperature per corner is available "
                       "(no in-game Heat screen to read the 3-zone inner/middle/outer "
@@ -905,6 +950,13 @@ class Controller:
         noise = (max(laps) - min(laps)) if len(laps) >= 2 else 0.0
         self.stats = self._best_lap_stats if self._best_lap_stats is not None else self.stats
         self.tyre_reading = self._best_lap_reading
+        if not self._channels_logged and self.stats is not None:
+            self._channels_logged = True
+            ch = self.stats.channels_available()
+            live = [k for k, v in ch.items() if v] or ["lap-time only"]
+            _laplog.info("CHANNELS LIVE this session: %s (missing: %s).",
+                         ", ".join(live), ", ".join(k for k, v in ch.items() if not v) or "none")
+            self.log("[telemetry] richer channels live: " + ", ".join(live))
         cand = fitness.bin_lap(self._test_packets)
         self._consume_ride_progress()
         _laplog.info("measurement: laps=%s -> %s %.2fs noise %.2fs telem(live=%s src=%s n=%d)",
@@ -1069,8 +1121,10 @@ class Controller:
             r.seg_before_s = self.best_segment
             r.seg_after_s = test_time
         _laplog.info("FITNESS(telemetry): composite %+.3f [grip %+.3f exit %+.3f trac %+.3f "
-                     "minspd %+.2f targeted(%s) %+.3f] | lap %+.2fs | rigour=%s",
+                     "minspd %+.2f cleanspin %+.3f roll %+.3f ride %+.3f targeted(%s) %+.3f] "
+                     "| lap %+.2fs | rigour=%s",
                      comp.delta, comp.grip, comp.exit, comp.traction, comp.minspeed,
+                     comp.cleanspin, comp.bodyroll, comp.ride,
                      fitness.targeted_channel(group) or "-", comp.targeted, lap_delta, self.rigour)
         apparent_win = comp.delta > fitness.COMPOSITE_IMPROVE_EPS
 
@@ -1453,6 +1507,7 @@ class Controller:
             return
         path, g, udp = (self.lap_heat_fn() if self.lap_heat_fn else (None, 0.0, None))
         self._read_heat(path, g, udp_temps=udp)
+        self._warn_temp_blind_once()       # tarmac + no reading -> warn once, plainly
 
     def _track_fixation(self):
         """Anti-fixation: count CONSECUTIVE iterations spent on each axle's
@@ -2056,6 +2111,8 @@ class Controller:
             "console_mode": self.console_mode,
             "console_notice": self.CONSOLE_NOTICE if self.console_mode else None,
             "lan_ip": self.lan_ip() if self.console_mode else None,
+            "temp_blind": self.temp_blind(),
+            "temp_notice": self.TEMP_BLIND_NOTICE if self.temp_blind() else None,
             "budget_min": self.time_budget_min or None,
             "budget_remaining_s": self.budget_remaining_s(),
             "budget_expired": self._budget_expired,

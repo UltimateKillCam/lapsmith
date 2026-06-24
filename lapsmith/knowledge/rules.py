@@ -633,7 +633,8 @@ def _rule_spring_balance(stats, tune, disc, tyre_reading, road_band, limits,
         if new > tune.spring_r + eps:
             return Recommendation("spring_balance", {"spring_r": new},
                 f"Understeer persists with ARBs saturated (rear {tune.arb_r:.0f}, front "
-                f"{tune.arb_f:.0f}) - stiffening the REAR spring shifts grip to the front.",
+                f"{tune.arb_f:.0f}){_pitch_note(stats)} - stiffening the REAR spring shifts "
+                "grip to the front.",
                 "Front bites harder; rotation improves where the ARB can no longer help.",
                 f"Rear spring {tune.spring_r:.1f} -> {new:.1f} kgf/mm")
     if ra - fa > OS_DEG and arb_os_saturated:
@@ -649,6 +650,35 @@ def _rule_spring_balance(stats, tune, disc, tyre_reading, road_band, limits,
 
 
 # --- E. diff ----------------------------------------------------------------
+_WHEEL_NAMES = {"FL": "front-left", "FR": "front-right",
+                "RL": "rear-left", "RR": "rear-right"}
+
+
+def _spin_note(stats) -> str:
+    """Name the specific wheel spinning under power, when per-wheel data is live -
+    sharper than the axle-average slip figure (e.g. '(rear-left spinning 0.52)')."""
+    if getattr(stats, "chan_per_wheel_slip", False) and stats.power_spin_wheel:
+        return f" ({_WHEEL_NAMES[stats.power_spin_wheel]} spinning {stats.power_spin_slip:.2f})"
+    return ""
+
+
+def _lock_note(stats) -> str:
+    """Name the specific wheel locking under braking (per-wheel slip + WheelRotationSpeed)."""
+    if getattr(stats, "chan_per_wheel_slip", False) and stats.brake_lock_wheel:
+        conf = " - rotation ~0, confirmed locked" if stats.brake_lock_confirmed else ""
+        return f" ({_WHEEL_NAMES[stats.brake_lock_wheel]} locking{conf})"
+    return ""
+
+
+def _pitch_note(stats) -> str:
+    """Cite front-vs-rear suspension compression (corroborates a balance call)."""
+    if getattr(stats, "chan_suspension", False) and abs(stats.pitch_bias) > 0.05:
+        which = ("front compresses more than rear" if stats.pitch_bias < 0
+                 else "rear compresses more than front")
+        return f"; suspension shows {which}"
+    return ""
+
+
 def _rule_diff(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[Recommendation]:
     os_thresh = _diff_slip_thresh(disc, ON_POWER_OS_SLIP, ON_POWER_OS_SLIP_DIRT)
     us_thresh = _diff_slip_thresh(disc, EXIT_US_FRONT_SLIP, EXIT_US_FRONT_SLIP_DIRT)
@@ -669,7 +699,7 @@ def _rule_diff(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[R
                           "target, not a fault)" if accel_floor else "")
             return Recommendation("diff", {"diff_rear_accel": _round(new, 1)},
                 f"On-power oversteer: rear slip ratio {stats.on_throttle_rear_slip:.2f} "
-                f"under throttle (> {os_thresh}).",
+                f"under throttle (> {os_thresh}){_spin_note(stats)}.",
                 "Cleaner corner exits; rear lays power down without stepping out.",
                 f"Rear accel diff {tune.diff_rear_accel:.0f} -> {new:.0f} %{floor_note}")
     # FWD on-power understeer: the DRIVEN front wheels spin/scrabble under throttle ->
@@ -680,7 +710,8 @@ def _rule_diff(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[R
         if new != tune.diff_front_accel:
             return Recommendation("diff", {"diff_front_accel": _round(new, 1)},
                 f"FWD on-power front wheelspin: front slip ratio "
-                f"{stats.on_throttle_front_slip:.2f} under throttle (> {os_thresh}).",
+                f"{stats.on_throttle_front_slip:.2f} under throttle (> {os_thresh})"
+                f"{_spin_note(stats)}.",
                 "Inside front frees up; less power-on understeer and torque steer.",
                 f"Front accel diff {tune.diff_front_accel:.0f} -> {new:.0f} %")
     # AWD exit understeer: front slip rising on throttle -> send more torque rear
@@ -699,7 +730,8 @@ def _rule_diff(stats, tune, disc, tyre_reading, road_band, limits) -> Optional[R
         new = _clamp(tune.diff_rear_decel - DIFF_STEP, 0.0, 100.0)
         if new != tune.diff_rear_decel:
             return Recommendation("diff", {"diff_rear_decel": _round(new, 1)},
-                f"Entry instability: rear slip {stats.braking_rear_slip:.2f} under braking.",
+                f"Entry instability: rear slip {stats.braking_rear_slip:.2f} under "
+                f"braking{_lock_note(stats)}.",
                 "Rear stays planted on corner entry; less trail-brake snap.",
                 f"Rear decel diff {tune.diff_rear_decel:.0f} -> {new:.0f} %")
     return None

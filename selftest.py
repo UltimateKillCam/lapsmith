@@ -944,7 +944,8 @@ def test_dirt_diff_and_lever_cap():
           and not any("diff_rear_accel" in r.fields for r in lock_b))
 
 
-def _telem_lap(lap_time, exit_g=1.0, grip=1.2, slip=0.30, n=150, brk=0, thr_corner=90):
+def _telem_lap(lap_time, exit_g=1.0, grip=1.2, slip=0.30, n=150, brk=0, thr_corner=90,
+               wheelspin=0.0, vy=0.0, roll=0.0):
     """One lap of synthetic telemetry binnable by track position: corner bins (lateral
     g), corner-exit bins (throttle-on forward g + rear slip), and straights.
     `exit_g` is the corner-exit forward g (the 'how quickly it accelerates' channel);
@@ -968,10 +969,20 @@ def _telem_lap(lap_time, exit_g=1.0, grip=1.2, slip=0.30, n=150, brk=0, thr_corn
             v["accel_z"] = exit_g * 9.80665
             v["tire_slip_ratio_rl"] = slip
             v["tire_slip_ratio_rr"] = slip
+            if wheelspin:                 # richer-channel knob: per-wheel wheelspin
+                for w in ("fl", "fr", "rl", "rr"):
+                    v[f"tire_slip_ratio_{w}"] = wheelspin
             v["speed"] = 34.0
         else:                             # straight
             v["accel_z"] = 0.3 * 9.80665
             v["speed"] = 60.0
+        if vy:                            # richer-channel knob: vertical-g (ride)
+            v["accel_y"] = vy * 9.80665
+        if roll and ph < 12:              # richer-channel knob: L-R suspension asymmetry
+            v["susp_norm_fl"] = 0.5 - roll / 2.0
+            v["susp_norm_fr"] = 0.5 + roll / 2.0
+            v["susp_norm_rl"] = 0.5 - roll / 2.0
+            v["susp_norm_rr"] = 0.5 + roll / 2.0
         out.append(parse(simulator._build_packet(v)))
     return out
 
@@ -1577,6 +1588,145 @@ def test_critical_fixes_v0113():
         c.change_applied()
         check("#4 the on-car state updates ONLY on the real F8 apply",
               applied <= set(c._on_car))
+
+
+def test_logging_v0114():
+    print("\n== logging: decision log (full trail, raw excluded), bundle, no-temp warning ==")
+    import os, json, tempfile, zipfile, logging
+    from lapsmith.gui import controller as C
+    from lapsmith.gui.controller import _rawlog
+    from lapsmith.state.tune_state import CarLimits
+    from lapsmith.state import store
+    from lapsmith import identity
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+    store.set_sessions_dir(tempfile.mkdtemp(prefix="lapsmith_log_"))
+    _rawlog.propagate = False        # mirror production (setup_logging sets this)
+
+    # --- #1/#2: the per-session DECISION log captures the full trail, raw excluded ---
+    c = C.Controller(); c.identity = ident; c.persist = True
+    c.apply_setup("road", CarLimits(), drivetrain="FWD")    # SETUP + drivetrain decision
+    c.best_segment = 55.0
+    c.stats = aggregate(_window("understeer")); c.tyre_reading = None
+    c._compute_batch()                                      # RULES trace + batch emitted
+    # emit some HIGH-FREQUENCY raw telemetry - it must NOT land in the decision log
+    _rawlog.info("lap-fields RAW: IsRaceOn@0=1 LapNumber@312=3")
+    _rawlog.info("tick DETECT: n=5 advancing=True")
+    logp = store.session_log_path(c._meta()["car"], c.discipline)
+    text = open(logp, encoding="utf-8").read()
+    check("#1 decision log records SESSION START + drivetrain + setup",
+          "SESSION START" in text and "DRIVETRAIN" in text)
+    check("#1 decision log records the per-iteration eligible-vs-fired RULES trace",
+          "RULES" in text and "batch emitted" in text)
+    check("#1 decision log records the proposed change",
+          "diff" in text or "arb" in text or "camber" in text)
+    check("#2 raw per-packet telemetry is EXCLUDED from the decision log (signal not noise)",
+          "lap-fields RAW" not in text and "tick DETECT" not in text)
+
+    # --- #3: the support bundle includes the decision log, not packet spam ---------
+    c.save_progress("in_progress")     # writes session.json etc. into the bundle dir
+    zp = store.write_support_bundle(car=c._meta()["car"], discipline=c.discipline,
+                                    env=c.env_info(), app_log=None)
+    with zipfile.ZipFile(zp) as z:
+        names = z.namelist()
+        decision = z.read("session_decision_log.txt").decode("utf-8") if \
+            "session_decision_log.txt" in names else ""
+    check("#3 support bundle contains the per-session decision log + environment.json",
+          "session_decision_log.txt" in names and "environment.json" in names)
+    check("#3 the bundled decision log is the useful trail, not raw packet spam",
+          "RULES" in decision and "lap-fields RAW" not in decision and "tick DETECT" not in decision)
+
+    # --- #4: no-temp-reader warning fires on a TARMAC run with temps absent --------
+    c.discipline = "road circuit"; c.console_mode = False
+    c.tyre_reading = None; c.last_reader = "none"; c.best_segment = 55.0
+    check("#4 temp_blind TRUE on tarmac with no temp reading", c.temp_blind() is True)
+    c._temp_warned = False
+    c._warn_temp_blind_once()
+    check("#4 the warning fires once and is recorded in the decision log",
+          c._temp_warned and "NO TEMP READER" in open(logp, encoding="utf-8").read())
+    st = c.status()
+    check("#4 the no-temp notice is surfaced in status (-> persistent overlay banner)",
+          st["temp_blind"] and "blind" in (st["temp_notice"] or "").lower())
+    # a real reading clears it; dirt + console never warn
+    c.tyre_reading = {"FL": {"inner": 90, "outer": 80}}; c.last_reader = "rapidocr"
+    check("#4 a real 3-zone reading clears the blind state", c.temp_blind() is False)
+    c.tyre_reading = None; c.last_reader = "none"; c.discipline = "dirt"
+    check("#4 dirt never warns (camber is lap-time-tuned there by design)", c.temp_blind() is False)
+    c.discipline = "road circuit"; c.console_mode = True
+    check("#4 console mode never warns (it has its own single-temp notice)", c.temp_blind() is False)
+
+
+def test_richer_channels_v0115():
+    print("\n== richer telemetry: wheel rotation, per-wheel slip, suspension, vertical-g ==")
+    from lapsmith.knowledge import fitness, rules
+    from lapsmith.state.tune_state import Tune, CarLimits
+    from lapsmith.telemetry.session import TestStats
+
+    # --- the previously-unparsed WheelRotationSpeed + vertical accel now parse -------
+    p = parse(simulator._build_packet(
+        {"is_race_on": 1, "speed": 30.0, "wheel_rot_fl": 12.5, "wheel_rot_rr": 0.3,
+         "accel_y": 9.80665}))
+    check("WheelRotationSpeed parses per corner (@100-112)",
+          abs(p.wheel_rot_fl - 12.5) < 1e-3 and abs(p.wheel_rot_rr - 0.3) < 1e-3)
+    check("vertical acceleration (accel_y) parses", abs(p.accel_y - 9.80665) < 1e-3)
+
+    def pk(**kw):
+        base = {"is_race_on": 1, "speed": 30.0}
+        base.update(kw)
+        return parse(simulator._build_packet(base))
+
+    # --- session names the worst-spinning DRIVEN wheel + the locking wheel ----------
+    onthr = [pk(accel=255, drivetrain_type=1, tire_slip_ratio_rl=0.52,
+                tire_slip_ratio_rr=0.10, tire_slip_ratio_fl=0.04, tire_slip_ratio_fr=0.04)
+             for _ in range(30)]
+    s = aggregate(onthr)
+    check("session identifies the worst-spinning DRIVEN wheel (RWD -> RL)",
+          s.power_spin_wheel == "RL" and s.chan_per_wheel_slip)
+    brk = [pk(brake=200, tire_slip_ratio_fl=-0.45, tire_slip_ratio_fr=-0.05,
+              wheel_rot_fl=0.2, wheel_rot_fr=8.0) for _ in range(30)]
+    sb = aggregate(brk)
+    check("session names the locking wheel (FL) and CONFIRMS via WheelRotationSpeed ~0",
+          sb.brake_lock_wheel == "FL" and sb.brake_lock_confirmed and sb.chan_wheel_rotation)
+    check("channels_available reports what was live",
+          aggregate(onthr).channels_available()["per_wheel_slip"] is True)
+
+    # --- the diff "why" cites the specific wheel; degrades gracefully without it -----
+    st = TestStats(drivetrain="RWD", on_throttle_rear_slip=0.5, on_throttle_front_slip=0.1,
+                   n_corner_frames=20, chan_per_wheel_slip=True,
+                   power_spin_wheel="RL", power_spin_slip=0.52)
+    rec = rules._rule_diff(st, Tune(), "road", None, True, CarLimits())
+    check("diff 'why' names the spinning wheel (rear-left spinning ...)",
+          rec is not None and "rear-left spinning" in rec.reason)
+    st0 = TestStats(drivetrain="RWD", on_throttle_rear_slip=0.5, on_throttle_front_slip=0.1,
+                    n_corner_frames=20)        # no per-wheel data
+    rec0 = rules._rule_diff(st0, Tune(), "road", None, True, CarLimits())
+    check("diff degrades gracefully without per-wheel data (still fires, generic why)",
+          rec0 is not None and "diff_rear_accel" in rec0.fields and "spinning" not in rec0.reason)
+    st2 = TestStats(drivetrain="RWD", braking_rear_slip=0.6, n_corner_frames=20,
+                    chan_per_wheel_slip=True, brake_lock_wheel="RL", brake_lock_confirmed=True)
+    rec2 = rules._rule_diff(st2, Tune(), "road", None, True, CarLimits())
+    check("braking 'why' names the locking wheel + confirms lockup",
+          rec2 is not None and "rear-left locking" in rec2.reason
+          and "confirmed locked" in rec2.reason)
+
+    # --- the composite uses the richer channels (and is inert when they're absent) ---
+    noisy = fitness.bin_lap(_telem_lap(60.0, exit_g=1.0, wheelspin=0.45, vy=0.6, roll=0.30))
+    clean = fitness.bin_lap(_telem_lap(60.0, exit_g=1.0, wheelspin=0.10, vy=0.1, roll=0.05))
+    comp = fitness.composite(clean, noisy, "road")
+    check("composite rewards less wheelspin + less body roll + smoother ride",
+          comp.cleanspin > 0 and comp.bodyroll > 0 and comp.ride > 0 and comp.delta > 0)
+    ref = fitness.bin_lap(_telem_lap(60.0, exit_g=1.0))          # richer channels flat (0)
+    cand = fitness.bin_lap(_telem_lap(60.0, exit_g=1.35))
+    cf = fitness.composite(cand, ref, "road")
+    check("composite is unaffected by the richer channels when they're absent (graceful)",
+          cf.cleanspin == 0.0 and cf.bodyroll == 0.0 and cf.ride == 0.0 and cf.exit > 0)
+
+    # --- spring-balance 'why' cites front-vs-rear suspension when live ---------------
+    sat = Tune(); sat.arb_r = rules.ARB_REAR_SOFT_FLOOR; sat.arb_f = rules.ARB_MIN
+    us = TestStats(slip_angle_front=4.0, slip_angle_rear=2.0, n_corner_frames=30,
+                   chan_suspension=True, pitch_bias=-0.2)        # front compresses more
+    sbr = rules._rule_spring_balance(us, sat, "road", None, True, CarLimits())
+    check("spring-balance 'why' cites front-vs-rear suspension travel when live",
+          sbr is not None and "front compresses more than rear" in sbr.reason)
 
 
 def test_batch_changes():
@@ -2472,6 +2622,8 @@ if __name__ == "__main__":
     test_troubleshooting_v0110()
     test_ux_v0112()
     test_critical_fixes_v0113()
+    test_logging_v0114()
+    test_richer_channels_v0115()
     test_batch_changes()
     test_multi_lap_fitness()
     test_lateral_capture_axis()

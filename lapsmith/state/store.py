@@ -334,14 +334,20 @@ def write_support_bundle(*, car: str, discipline: str, env: dict,
                          heat_frames: Optional[List[str]] = None,
                          max_log_bytes: int = 400_000,
                          max_frames: int = 6) -> str:
-    """Write ONE shareable zip with everything needed to diagnose a run: the
-    session JSON, the final tune sheet, the tail of app.log, recent captured Heat
-    frames, and an environment summary (resolution, reader used, API present)."""
+    """Write ONE shareable zip with everything needed to diagnose a run: the per-session
+    DECISION log (the primary debugging artefact - changes, rules, drivetrain, A/B/A,
+    final tune), the session JSON, the final tune sheet, an environment summary, recent
+    Heat frames, and a (now small, raw-free) tail of app.log. The raw per-packet
+    telemetry dumps are deliberately NOT included."""
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     base = f"{_slug(car)}_{_slug(discipline)}"
     zip_path = os.path.join(SESSIONS_DIR, base + "_support.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("environment.json", json.dumps(env, indent=2))
+        # THE decision log for this session, full + start-to-finish.
+        slog = session_log_path(car, discipline)
+        if os.path.exists(slog):
+            z.write(slog, "session_decision_log.txt")
         sj = session_path(car, discipline)
         if os.path.exists(sj):
             z.write(sj, "session.json")

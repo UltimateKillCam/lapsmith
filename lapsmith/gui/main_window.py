@@ -515,6 +515,20 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
                 "value so camber/toe are less accurate (no in-game Heat screen to read).")
             self.set_console.toggled.connect(self._set_console)
             form.addRow("Console mode", self.set_console)
+
+            # Verbose telemetry logging: the high-frequency raw per-packet dumps. OFF by
+            # default (kept out of app.log + the support bundle); ON writes them to a
+            # separate raw_telemetry.log for deep debugging.
+            from ..state import prefs as _prefs
+            self.set_verbose = QtWidgets.QCheckBox(
+                "Verbose telemetry logging (raw packets -> raw_telemetry.log)")
+            self.set_verbose.setChecked(bool(_prefs.get("verbose_telemetry", False)))
+            self.set_verbose.setToolTip(
+                "Off by default. The decision log (app.log + the per-session log) stays "
+                "readable; turn this on only to capture raw per-packet telemetry for "
+                "deep debugging - it does NOT go in the support bundle.")
+            self.set_verbose.toggled.connect(self._set_verbose)
+            form.addRow("Diagnostics", self.set_verbose)
             self.console_hint = QtWidgets.QLabel()
             self.console_hint.setWordWrap(True)
             self.console_hint.setStyleSheet("color:#9aa;font-size:11px")
@@ -616,6 +630,12 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             from ..state import prefs
             self.ctrl.set_time_budget(float(minutes))
             prefs.set("time_budget_min", float(minutes))
+
+        def _set_verbose(self, on):
+            from ..state import prefs
+            from . import app as _app
+            prefs.set("verbose_telemetry", bool(on))
+            _app.configure_raw_telemetry_log(bool(on))   # applies live
 
         def _set_console(self, on):
             """Toggle console mode: rebind the listener live, persist, update the hint."""

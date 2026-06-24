@@ -19,6 +19,7 @@ from . import ordinals
 from .telemetry.parser import Packet
 
 _log = logging.getLogger("lapsmith.identity")
+_rawlog = logging.getLogger("lapsmith.raw")     # raw car-info offset dump (high frequency)
 
 # Forza CarClass enum -> letter (display only)
 _CLASS_LETTER = {0: "D", 1: "C", 2: "B", 3: "A", 4: "S1", 5: "S2", 6: "X", 7: "X"}
@@ -80,10 +81,10 @@ def identify(packet: Packet) -> CarIdentity:
     # Log the RAW pre-insert car-info ints so a misdetect can be diagnosed from
     # one line. Sanity: an inline-6 (2JZ Supra) must read NumCylinders=6; if not,
     # the car-info offsets (212/216/220/224/228) are off and need re-walking.
-    _log.info("car-info RAW: CarOrdinal@212=%d CarClass@216=%d PI@220=%d "
-              "DrivetrainType@224=%d(%s) NumCylinders@228=%d",
-              packet.car_ordinal, packet.car_class, packet.car_pi,
-              raw_dt, _DRIVETRAIN.get(raw_dt, "?"), ncyl)
+    _rawlog.info("car-info RAW: CarOrdinal@212=%d CarClass@216=%d PI@220=%d "
+                 "DrivetrainType@224=%d(%s) NumCylinders@228=%d",
+                 packet.car_ordinal, packet.car_class, packet.car_pi,
+                 raw_dt, _DRIVETRAIN.get(raw_dt, "?"), ncyl)
     return CarIdentity(
         ordinal=packet.car_ordinal,
         name=ordinals.name_for(packet.car_ordinal),

@@ -75,7 +75,12 @@ _FIELDS = [
     ("tire_slip_ratio_fr",        "f", 88),
     ("tire_slip_ratio_rl",        "f", 92),
     ("tire_slip_ratio_rr",        "f", 96),
-    # 100..115 WheelRotationSpeed x4   (skipped)
+    # WheelRotationSpeed (rad/s) per corner: radius-free LOCKUP signal - a wheel at
+    # ~0 rad/s while the car is moving is locked, even when slip-ratio is noisy.
+    ("wheel_rot_fl",              "f", 100),
+    ("wheel_rot_fr",              "f", 104),
+    ("wheel_rot_rl",              "f", 108),
+    ("wheel_rot_rr",              "f", 112),
     # 116..131 WheelOnRumbleStrip x4   (skipped)
     # 132..147 WheelInPuddleDepth x4   (skipped)
     # 148..163 SurfaceRumble x4        (skipped)
@@ -166,6 +171,10 @@ class Packet:
     tire_slip_ratio_fr: float = 0.0
     tire_slip_ratio_rl: float = 0.0
     tire_slip_ratio_rr: float = 0.0
+    wheel_rot_fl: float = 0.0
+    wheel_rot_fr: float = 0.0
+    wheel_rot_rl: float = 0.0
+    wheel_rot_rr: float = 0.0
     tire_slip_angle_fl: float = 0.0
     tire_slip_angle_fr: float = 0.0
     tire_slip_angle_rl: float = 0.0
