@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from typing import Dict, List, Optional, Tuple
 
 from . import capture
@@ -162,21 +163,37 @@ def _box_center(box):
     return sum(xs) / len(xs), sum(ys) / len(ys)
 
 
-# FH6 Heat-page temps are always shown with ONE decimal (e.g. "66.8", "152.3°F").
-# Requiring that exact shape rejects HUD junk - speed "015", position "1/12",
-# lap "1:23.4", gamertags - so the positional fallback isn't polluted.
-_TEMP_RE = re.compile(r"^[+-]?\d{1,3}\.\d\s*[°\xba]?\s*[CFcf]?$")
+# FH6 renders the Celsius unit as the single glyph "℃" U+2103 (DEGREE CELSIUS),
+# sometimes preceded by "°" U+00B0, so RapidOCR returns tokens like "99.0 °℃",
+# "101.9°℃", "97.1℃", "970℃". The OLD matcher wanted ASCII "°C" (U+00B0 + U+0043),
+# which NEVER appears -> it matched ZERO tokens every run. We NFKC-normalise first
+# (U+2103 decomposes to "°C"), then accept a number followed by ANY run of degree/
+# Celsius marks. Two shapes are allowed and they reject HUD junk (speed "015",
+# position "1/12", lap "1:23.4", gamertags):
+#   - a one-decimal number (the normal Heat-page shape), unit optional; OR
+#   - a no-decimal number that MUST carry a unit (covers the mangled "970℃" = 97.0).
+_DEG = "°˚º℃"                 # ° ˚ º ℃  (℃ kept for the no-NFKC path)
+_TEMP_DECIMAL = re.compile(rf"^[+-]?\d{{1,3}}\.\d\s*[{_DEG}Cc]*\.?$")
+_TEMP_UNIT = re.compile(rf"^[+-]?\d{{1,3}}\s*[{_DEG}Cc]+\.?$")
+
+
+def _looks_like_temp(text: str) -> bool:
+    """True if an NFKC-normalised token has the Heat-page temperature shape."""
+    t = unicodedata.normalize("NFKC", str(text)).strip()
+    return bool(_TEMP_DECIMAL.match(t) or _TEMP_UNIT.match(t))
 
 
 def _temp_tokens(tokens):
-    """From [(text,(x,y))] keep TEMPERATURE numbers as (val,x,y). Matches only the
-    single-decimal Heat-page format, dropping speed / lap / position / name junk."""
+    """From [(text,(x,y))] keep TEMPERATURE numbers as (val,x,y). Accepts the unit in
+    every form OCR actually returns (℃ / ° / trailing C), tolerates a dropped decimal,
+    and sanity-bounds the value so garbage ("0.6'66") is rejected, not the whole read."""
     out = []
     for text, (x, y) in tokens:
-        t = str(text).strip()
-        if not _TEMP_RE.match(t):
+        if not _looks_like_temp(text):
             continue
+        t = unicodedata.normalize("NFKC", str(text))
         val = _parse_temp_text(re.sub(r"[^\d.]", "", t))
+        # 20-300 spans plausible tyre temps in C AND F (unit decided downstream).
         if val is not None and 20.0 <= val <= 300.0:
             out.append((val, x, y))
     return out
@@ -192,70 +209,143 @@ def _corner_centers(tokens):
     return corners
 
 
-def _zones_from_sorted(triple):
-    vals = [v for _, v in sorted(triple)]      # sorted by y (top->bottom)
-    return {"inner": vals[0], "mid": vals[1], "outer": vals[2]}
+def _zones_from_sorted(items):
+    """items: [(y, val), ...] for ONE corner, sorted top->bottom = inner, mid, outer.
+    Tolerant of a missing middle: with 2 values keep inner+outer and synthesise mid as
+    their mean - camber only needs the inner-vs-outer spread. None if <2."""
+    vals = [v for _, v in sorted(items)]       # sorted by y (top->bottom)
+    if len(vals) >= 3:
+        return {"inner": vals[0], "mid": vals[1], "outer": vals[2]}
+    if len(vals) == 2:
+        return {"inner": vals[0], "mid": (vals[0] + vals[1]) / 2.0, "outer": vals[1]}
+    return None
 
 
-def _map_by_labels(numbers, corners):
-    """Assign each number to its NEAREST corner label, then top->bottom in each."""
-    if len(corners) < 4:
-        return None
-    buckets = {k: [] for k in corners}
-    for val, x, y in numbers:
-        k = min(corners, key=lambda c: (corners[c][0] - x) ** 2 + (corners[c][1] - y) ** 2)
-        buckets[k].append((y, val))
-    out = {}
-    for k, lst in buckets.items():
-        if len(lst) >= 3:
-            out[k] = _zones_from_sorted(lst[:3] if len(lst) == 3 else sorted(lst)[:3])
-    return out if len(out) == 4 else None
+TYRE_C_LO, TYRE_C_HI = 20.0, 160.0   # plausible tyre-temp band (Celsius) for cleanup
+ZONE_OUTLIER_C = 30.0                # a zone this far from its corner-mates = a misread
+UDP_REPAIR_TOL_C = 22.0             # a corner mean this far from UDP TireTemp = drop it
 
 
-def _map_positional(numbers):
-    """No labels: split left/right by x, each column's numbers top->bottom into a
-    front (upper 3) and rear (next 3) tyre. Relative to detected positions."""
-    if len(numbers) < 12:
+def _axle_split(col):
+    """One x-column of (val,x,y) -> (front_group, rear_group), split top->bottom at the
+    LARGEST vertical gap (the inter-corner gap exceeds an axle's own zone spacing). With
+    <=3 numbers it's a single corner (front)."""
+    g = sorted(col, key=lambda n: n[2])            # by y, top->bottom
+    if len(g) <= 3:
+        return g, []
+    gi = max(range(len(g) - 1), key=lambda i: g[i + 1][2] - g[i][2])
+    return g[:gi + 1][:3], g[gi + 1:][:3]
+
+
+def _map_by_coords(numbers, corners):
+    """Map temp boxes to corners by COORDINATES ONLY - never by the order RapidOCR
+    emitted them (its reading order is unstable because the Heat panel overlays live
+    gameplay, so scenery tokens interleave and labels can arrive out of order).
+
+    Split into LEFT/RIGHT columns at the x-midpoint, each column into FRONT/REAR at the
+    largest y-gap, zones inner/mid/outer top->bottom. Geometry decides orientation
+    (smaller x = Left, smaller y = Front); the corner LABEL boxes, when a clean 1:1 set
+    is present, RELABEL each cluster by its nearest label (handles an unusual layout).
+    Returns {corner: zones} for whatever corners could be formed - PARTIAL is fine."""
+    if len(numbers) < 4:
         return None
     xs = sorted(n[1] for n in numbers)
-    xmed = xs[len(xs) // 2]
-    left = [n for n in numbers if n[1] < xmed]
-    right = [n for n in numbers if n[1] >= xmed]
-    if len(left) < 6 or len(right) < 6:
-        return None
+    xmid = (xs[0] + xs[-1]) / 2.0                  # two columns are well separated
+    left = [n for n in numbers if n[1] < xmid]
+    right = [n for n in numbers if n[1] >= xmid]
+    if not left or not right:
+        return None                                # couldn't localise two columns
 
-    def column(group):
-        g = sorted(group, key=lambda n: n[2])      # by y
-        front = [(n[2], n[0]) for n in g[:3]]
-        rear = [(n[2], n[0]) for n in g[3:6]]
-        return _zones_from_sorted(front), _zones_from_sorted(rear)
+    clusters = []                                  # (geom_corner, group)
+    for side, col in (("L", left), ("R", right)):
+        front, rear = _axle_split(col)
+        if front:
+            clusters.append(("F" + side, front))
+        if rear:
+            clusters.append(("R" + side, rear))
 
-    fl, rl = column(left)
-    fr, rr = column(right)
-    return {"FL": fl, "FR": fr, "RL": rl, "RR": rr}
+    # If 4 labels are present, relabel each cluster by its NEAREST label, but only if it
+    # yields a clean bijection (no two clusters claiming the same corner); else geometry.
+    if len(corners) >= 4:
+        chosen, used, ok = {}, set(), True
+        for _geom, grp in clusters:
+            cx = sum(n[1] for n in grp) / len(grp)
+            cy = sum(n[2] for n in grp) / len(grp)
+            k = min(corners, key=lambda c: (corners[c][0] - cx) ** 2 + (corners[c][1] - cy) ** 2)
+            if k in used:
+                ok = False
+                break
+            used.add(k)
+            chosen[k] = grp
+        if ok:
+            clusters = list(chosen.items())
+
+    out = {}
+    for corner, grp in clusters:
+        z = _zones_from_sorted([(n[2], n[0]) for n in grp])
+        if z:
+            out[corner] = z
+    return out or None
+
+
+def _clean_corner(z):
+    """Drop a zone that's implausible (outside the tyre band) or WILDLY off its
+    corner-mates (a single misread number), keeping the rest. Camber then simply skips a
+    corner left without both inner and outer."""
+    if not z:
+        return z
+    vals = sorted(z.values())
+    med = vals[len(vals) // 2]
+    return {k: v for k, v in z.items()
+            if TYRE_C_LO <= v <= TYRE_C_HI and abs(v - med) <= ZONE_OUTLIER_C}
+
+
+def _udp_repair(out, udp_temps):
+    """Per-corner sanity vs the trusted UDP TireTemp: DROP a corner whose mean is far
+    from its UDP value (a localised misread) rather than failing all four. Returns the
+    repaired reading + a short note of what was dropped."""
+    if not udp_temps:
+        return out, ""
+    kept, dropped = {}, []
+    for k, z in out.items():
+        if z and k in udp_temps and abs(sum(z.values()) / len(z) - udp_temps[k]) > UDP_REPAIR_TOL_C:
+            dropped.append(k)
+            continue
+        kept[k] = z
+    return kept, (f", dropped {'/'.join(dropped)} (UDP mismatch)" if dropped else "")
 
 
 def tokens_to_reading(tokens, udp_temps=None):
-    """Pure: [(text,(x,y))] -> normalized Celsius schema, or None. Anchors numbers
-    to tyres by labels (fallback: position), detects unit, UDP cross-checks."""
+    """[(text,(x,y))] -> normalized Celsius schema, or None. Maps numbers to tyres purely
+    by BOX COORDINATES (order-independent), accepts a PARTIAL read (10-11 of 12, even 1
+    full axle), and repairs/drops a single misread corner via UDP rather than failing
+    the whole frame. Only temp + corner-label boxes matter; scenery tokens are ignored."""
     log = logging.getLogger("lapsmith.ocr")
-    numbers = _temp_tokens(tokens)
-    if len(numbers) < 12:
-        log.warning("RapidOCR: only %d temp tokens found", len(numbers))
+    numbers = _temp_tokens(tokens)                 # scenery / HUD junk already filtered out
+    if len(numbers) < 6:
+        log.warning("OCR: only %d temp tokens parsed (need >=6 for even a partial read)",
+                    len(numbers))
         return None
-    mapping = _map_by_labels(numbers, _corner_centers(tokens)) or _map_positional(numbers)
+    mapping = _map_by_coords(numbers, _corner_centers(tokens))
     if not mapping:
-        log.warning("RapidOCR: could not map %d numbers to tyres", len(numbers))
+        log.warning("OCR: parsed %d temps but could not localise the L/R columns", len(numbers))
         return None
-    unit = _choose_unit([v for vals in mapping.values() for v in vals.values()], udp_temps)
-    raw = {"unit": unit, **mapping}
-    out = _normalize(raw)
-    if not _is_valid(out):
+    unit = _choose_unit([v for d in mapping.values() for v in d.values()], udp_temps)
+    out = _normalize({"unit": unit, **mapping})
+    out = {k: c for k, z in out.items() if z and (c := _clean_corner(z))}
+    out, note = _udp_repair(out, udp_temps)        # drop a misread corner, keep the rest
+    # USE it if at least one corner carries a real inner-vs-outer spread (camber can fire
+    # for that axle); a couple of dropped zones no longer discards the whole read.
+    usable = sum(1 for z in out.values() if "inner" in z and "outer" in z)
+    zone_n = sum(len(z) for z in out.values())
+    if usable < 1 or zone_n < 6:
+        log.warning("OCR: mapped %d zones%s but no axle had a usable inner/outer spread",
+                    zone_n, note)
         return None
-    ok, detail = _udp_crosscheck(out, udp_temps)
-    log.info("RapidOCR read unit=%s xcheck=%s -> %s", unit, detail or "none",
-             {k: {z: round(v, 1) for z, v in d.items()} for k, d in out.items()})
-    return out if ok else None
+    pretty = " ".join(f"{k} " + "/".join(f"{out[k][z]:.1f}" for z in _ZONES if z in out[k])
+                      for k in _TYRES if k in out)
+    log.info("OCR temps (3-zone, unit=%s, mapped %d/12%s): %s", unit, zone_n, note, pretty)
+    return out
 
 
 def rapidocr_read_image(path: str, udp_temps: Optional[Dict[str, float]] = None

@@ -1002,6 +1002,19 @@ class Controller:
                             "to": fmt_field(fld, to, self.pressure_unit)})
         return out
 
+    def is_drive_only_step(self) -> bool:
+        """True when the current SHOW_CHANGE step asks the user to JUST DRIVE - there is
+        NOTHING to change in the tune menu (every field's from==to). These steps must
+        NOT gate on F8: they auto-advance straight to the measured lap. F8 is reserved
+        for steps that hand the user actual change(s) to enter (the amber state).
+
+        Covers re-anchor (drive the current tune again) and any A/B/A re-drive or final
+        check where no value actually changes - decided per-step by the real checklist.
+        The baseline-entry phase is NOT SHOW_CHANGE, so it still requires F8."""
+        if self.phase != SHOW_CHANGE or not self.batch or not self._on_car:
+            return False        # car state unknown -> treat as a real change (needs F8)
+        return not self.menu_checklist()
+
     def ui_state(self) -> dict:
         """Classify the overlay into ACTION (edit the menu now) vs DRIVE (touch nothing)
         vs DONE, with an unambiguous header and - for ACTION - the exact checklist, so a
@@ -1023,14 +1036,27 @@ class Controller:
         if ph == SHOW_CHANGE:
             grp = self.batch[0].group if self.batch else ""
             cl = self.menu_checklist()
+            if self.is_drive_only_step():
+                # DRIVE-ONLY: nothing to change in the tune menu (every field's from==to).
+                # Just drive - this auto-advances, NO F8 required. Covers re-anchor, an
+                # A/B/A re-drive / final check that needs no value change, etc.
+                headers_drive = {
+                    "reanchor": "RE-ANCHOR - drive the current tune, no changes",
+                    "final_baseline": "Car is already on the baseline - just drive",
+                    "confirm_revert": "DOUBLE-CHECK - just drive the current tune again",
+                    "confirm_reapply": "CONFIRMED - just drive",
+                }
+                return {"klass": "drive",
+                        "header": headers_drive.get(grp, "Just drive this lap - no changes"),
+                        "sub": "Nothing to change in the menu - just drive this lap; it "
+                               "advances on its own.", "checklist": []}
             if grp == "reanchor":
-                return {"klass": "drive", "header": "RE-ANCHOR - drive current tune, no changes",
-                        "sub": "No change to enter - drive a clean lap, press F8 when at the line.",
-                        "checklist": []}
-            if grp == "final_baseline" and not cl:
-                return {"klass": "drive", "header": "Car is already on the baseline - just drive",
-                        "sub": "Everything was reverted. Drive one clean lap for the honest "
-                               "final check, then press F8.", "checklist": []}
+                # #3: on-car differs from the current tune (e.g. after a bundled revert) -
+                # state EXACTLY what to set first, THEN drive (this one does need F8).
+                return {"klass": "action", "action": "reanchor",
+                        "header": "RE-ANCHOR - first set the car to the current tune, then drive",
+                        "sub": "Match these to the current tune, then drive one clean lap, F8.",
+                        "checklist": cl}
             headers = {
                 "final_baseline": "CHANGE THESE NOW - set the car back to the baseline",
                 "confirm_revert": "DOUBLE-CHECK - re-drive the PREVIOUS setup",
@@ -1120,6 +1146,7 @@ class Controller:
         if self._reanchor_pending:                      # re-measure of the accepted tune (C)
             self._reanchor_pending = False
             self._applied_records = []
+            self._on_car = self.state.current.as_dict()  # #3: re-anchor changes nothing; keep truthful
             if cand.live:
                 self._ref_telem = cand
             if self.best_segment is None or test_time < self.best_segment:
@@ -1259,10 +1286,27 @@ class Controller:
             r.verdict = "reverted"
 
     # --- telemetry-primary gate (H) + A/B/A (B) --------------------------------
+    def _physical_fault_reduced(self, comp, group, fields) -> bool:
+        """Did the change measurably reduce the specific DIAGNOSED physical fault it was
+        made to fix - a signal a warmed-up driver cannot fake (unlike lap time)? Scoped
+        to the clearly-measurable faults so ordinary performance tweaks (exit-g diff,
+        grip ARB) still go through the normal driver-discount / A-B-A path:
+          - a ride-height raise for WIDESPREAD bottoming -> the lap bottoms measurably
+            less (vertical-harshness 'ride' channel improved);
+          - a DECEL-diff change for brake LOCKUP -> less wasteful slip ('traction' up)."""
+        eps = fitness.COMPOSITE_IMPROVE_EPS
+        if group == "ride_height" and self._cur_bottoming_axles and comp.ride > eps:
+            return True
+        if group == "diff" and any("decel" in f for f in fields) and comp.traction > eps:
+            return True
+        return False
+
     def _gate_change(self, test_time, noise, cand):
         """Judge a measured change PRIMARILY on the binned-telemetry composite, with
         lap time as a guardrail. Apparent wins go through A/B/A (confirmed rigour) to
-        separate a real tune gain from the driver simply improving over the session."""
+        separate a real tune gain from the driver simply improving over the session -
+        EXCEPT evidence-backed changes whose physical fault measurably reduced, which are
+        kept on telemetry (the lap-time A/B/A can't be trusted to veto those)."""
         ref = self._ref_telem
         group = self._applied_records[0].lever_group if self._applied_records else ""
         comp = fitness.composite(cand, ref, self.discipline, group=group)
@@ -1295,11 +1339,37 @@ class Controller:
             self._next_step()
             return
 
+        # EVIDENCE-BACKED, TELEMETRY-CONFIRMED KEEP (#2): a change justified by a
+        # PERSISTENT PHYSICAL fault (bottoming %, inner/outer temp spread, lockup/slip)
+        # whose targeted telemetry MEASURABLY improved is KEPT on the telemetry - NOT
+        # vetoed by lap-time A/B/A, the one signal a warmed-up driver contaminates. A
+        # warmer driver can't cool a tyre's outer edge or un-bottom the car. Lap time
+        # already cleared the guardrail above, so it didn't clearly hurt.
+        batch_fields = set().union(*[set(r.fields) for r in self._applied_records]) \
+            if self._applied_records else set()
+        if apparent_win and rules._kind_of(group) == "evidence" \
+                and self._physical_fault_reduced(comp, group, batch_fields):
+            self._keep_batch(test_time, cand)
+            _laplog.info("EVIDENCE-KEEP: group=%s targeted=%+.3f ride=%+.3f composite=%+.3f "
+                         "lap=%+.2fs - physical fault measurably reduced; kept on telemetry, "
+                         "lap-time A/B/A veto SKIPPED.", group, comp.targeted, comp.ride,
+                         comp.delta, lap_delta)
+            self.log("[fitness] change KEPT on TELEMETRY - the targeted fault measurably "
+                     f"improved (targeted {comp.targeted:+.3f}, composite {comp.delta:+.3f}); "
+                     "evidence-backed, so not vetoing on lap-time (driver warm-up can't "
+                     "cool a tyre edge or un-bottom the car).")
+            self._lock_bottoming_if_no_improve(True, lap_delta)   # clears the bottoming flag
+            self._applied_records = []
+            self.state.iteration += 1
+            self._next_step()
+            return
+
         if apparent_win:
             # DRIVER-INPUT DISCOUNTING: if the human drove notably differently this lap
             # (throttle/brake/steering changed), the apparent gain is likely the DRIVER,
             # not the tune - so DISCOUNT it WITHOUT a full A/B/A re-test. Only fall back
             # to A/B/A when the inputs look the SAME but the result moved (inconclusive).
+            # RESERVED for WEAK / lap-time-only changes; evidence-backed wins were kept above.
             in_delta = fitness.input_difference(cand, ref)
             if 0.0 <= in_delta and in_delta > fitness.INPUT_DRIVER_THRESH:
                 self._aba_saved += 1
@@ -1408,6 +1478,9 @@ class Controller:
             if self.best_segment is None or aprime_time < self.best_segment:
                 self.best_segment = aprime_time
             self._iters_since_reanchor = 0
+            # #3: A is kept (the car was reverted to it) - the on-car model IS the
+            # current tune now, so the next checklist/re-anchor is truthful.
+            self._on_car = self.state.current.as_dict()
             _laplog.info("A/B/A: DISCARDED (composite %+.3f vs A' <= eps) - gain was DRIVER DRIFT; "
                          "kept A and re-anchored to A' %.2f.", comp.delta, aprime_time)
             self.log("[A/B/A] The gain was driver improvement, not the tune - DISCARDED; kept the "
@@ -1737,8 +1810,9 @@ class Controller:
         if reading is None and read_tyres.rapidocr_available():
             reading = read_tyres.rapidocr_read_image(heat_path, udp_temps=udp_temps)
             if reading is not None:
-                self.last_reader = "rapidocr"
-                self.log("[heat] local OCR (RapidOCR) read the frame (UDP-checked).")
+                self.last_reader = "ocr_3zone"     # a real 3-zone read -> drives camber/toe
+                self.log(f"[heat] local OCR read the 3-zone temps ({len(reading)} corners) "
+                         "- tuning camber/toe from them.")
         # 2) FALLBACK - Tesseract (resolution-relative boxes, 16:9 best-effort)
         if reading is None:
             reading = read_tyres.ocr_heat_page(heat_path, udp_temps=udp_temps)
@@ -1912,6 +1986,9 @@ class Controller:
             for rec in self.batch:
                 self.state.apply_change(rec.group, rec.fields, rec.reason, rec.feel_for)
                 self._on_car.update(rec.fields)        # user physically re-entered B
+            # #3: the car is now EXACTLY the current tune - sync the full on-car model so
+            # nothing drifts through a bundled re-apply (the checklist stays truthful).
+            self._on_car = self.state.current.as_dict()
             keep = self._aba_keep or {}
             self._aba_keep = None
             if keep.get("b_telem") is not None and getattr(keep["b_telem"], "live", False):
@@ -1940,6 +2017,11 @@ class Controller:
         if self.batch[0].group == "final_baseline":
             # instruction-only rec; the user re-enters the baseline tune by hand
             self._on_car = self.baseline.as_dict() if self.baseline else self._on_car
+        elif self.batch[0].group == "confirm_revert":
+            # #3: the user reverted (possibly a BUNDLED multi-field revert) back to the
+            # previous tune = the current state. Sync the FULL on-car model so a later
+            # re-anchor / final check never wrongly reads "already on baseline".
+            self._on_car = self.state.current.as_dict()
         if self.mode == MODE_AUTO:
             self._awaiting_test = True
             self._await_state = "out_lap"

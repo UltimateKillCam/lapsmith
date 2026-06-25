@@ -1807,6 +1807,317 @@ def test_recalibration_v0116():
           rules.WARMUP_LAPS == 1)
 
 
+def test_v0123_ocr_box_coord_mapping():
+    print("\n== v0.1.23: OCR maps by BOX COORDINATES (order-independent), partial reads, repair ==")
+    from lapsmith.vision import read_tyres as RT
+    from lapsmith.knowledge import rules
+    W, H = 1920, 1080
+    CEL = "℃"
+    # FH6 layout: FL top-left, FR top-right, RL bottom-left, RR bottom-right; each tyre's
+    # zones inner/mid/outer stacked top->bottom. Rear outer much cooler => camber signal.
+    grid = {"FL": (0.40 * W, 0.30 * H, [99.5, 97.8, 96.1]),
+            "FR": (0.60 * W, 0.30 * H, [99.0, 97.5, 95.8]),
+            "RL": (0.40 * W, 0.55 * H, [95.0, 93.0, 82.0]),
+            "RR": (0.60 * W, 0.55 * H, [94.5, 92.5, 81.5])}
+    udp = {"FL": 97.8, "FR": 97.4, "RL": 90.0, "RR": 89.5}
+
+    def temps():
+        out = []
+        for _name, (x, y0, zs) in grid.items():
+            for i, v in enumerate(zs):
+                out.append((f"{v}{CEL}", (x, y0 + i * 0.05 * H)))
+        return out
+    labels = [("Front Left", (0.40 * W, 0.25 * H)), ("Front Right", (0.60 * W, 0.25 * H)),
+              ("Rear Left", (0.40 * W, 0.50 * H)), ("Rear Right", (0.60 * W, 0.50 * H))]
+
+    def maps_ok(toks, label):
+        out = RT.tokens_to_reading(toks, udp_temps=udp)
+        ok = (out is not None and "FL" in out and abs(out["FL"]["inner"] - 99.5) < 0.2
+              and abs(out["FL"]["outer"] - 96.1) < 0.2 and "RR" in out
+              and abs(out["RR"]["outer"] - 81.5) < 0.2)
+        check(f"{label}: maps every corner by coordinate", ok)
+        return out
+
+    # 1) clean order
+    maps_ok(temps() + labels, "clean order")
+    # 2) labels OUT OF ORDER (Front Right before Front Left) + reversed temp order:
+    #    coordinate mapping ignores emission order, so it still maps correctly
+    reordered = list(reversed(temps()))
+    lbl_oo = [labels[1], labels[0], labels[3], labels[2]]
+    maps_ok(reordered + lbl_oo, "labels out of order + reversed temps")
+    # 3) scenery / HUD tokens interleaved between temps - must be IGNORED, not pollute
+    scenery = [("#FasterTg", (0.5 * W, 0.10 * H)), ("355", (0.7 * W, 0.80 * H)),
+               ("Checkpoint", (0.2 * W, 0.90 * H)), ("337 M", (0.8 * W, 0.85 * H)),
+               ("Chect", (0.3 * W, 0.05 * H)), ("Heat", (0.5 * W, 0.20 * H))]
+    woven = []
+    for i, t in enumerate(temps()):
+        woven.append(t)
+        if i < len(scenery):
+            woven.append(scenery[i])
+    maps_ok(woven + labels, "scenery interleaved")
+    # 4) 11 of 12 (drop FR middle zone) still maps and is USED
+    fr_mid_y = 0.30 * H + 0.05 * H
+    toks11 = [t for t in temps()
+              if not (abs(t[1][0] - 0.60 * W) < 1 and abs(t[1][1] - fr_mid_y) < 1)]
+    out11 = RT.tokens_to_reading(toks11 + labels, udp_temps=udp)
+    check("11/12 (a zone dropped) still maps and is usable",
+          out11 is not None and "FR" in out11 and "inner" in out11["FR"] and "outer" in out11["FR"])
+
+    # 5) the coordinate-mapped 3-zone read actually drives camber (rear outer 13C cooler)
+    out = RT.tokens_to_reading(temps() + labels, udp_temps=udp)
+    rec = rules._rule_camber(aggregate(_window("understeer")),
+                             build_baseline("C", "S1 800", "road", 50.0, "RWD"),
+                             "road", out, True, rules.CarLimits())
+    check("camber fires from the box-coordinate 3-zone read", rec is not None and rec.group == "camber")
+
+    # 6) controller marks the reader 'ocr_3zone' on a real OCR read (drives camber/toe)
+    from lapsmith.gui import controller as C
+    import lapsmith.vision.read_tyres as RTmod
+    c = C.Controller(); c.discipline = "road"
+    orig = (RTmod.rapidocr_available, RTmod.vision_available, RTmod.ocr_heat_page)
+    RTmod.rapidocr_available = lambda: True
+    RTmod.vision_available = lambda: False
+    RTmod.rapidocr_read_image = lambda p, udp_temps=None: {"FL": {"inner": 99.5, "outer": 96.1},
+                                                           "FR": {"inner": 99.0, "outer": 95.8}}
+    try:
+        c._read_heat("frame.png", peak_g=1.0, udp_temps=udp)
+        check("OCR success sets temp_reader_used='ocr_3zone' (not blind)",
+              c.last_reader == "ocr_3zone" and c.tyre_reading is not None)
+    finally:
+        RTmod.rapidocr_available, RTmod.vision_available, RTmod.ocr_heat_page = orig
+
+
+def test_v0123_evidence_keep():
+    print("\n== v0.1.23 #2: evidence-backed fault fix KEPT on telemetry; weak change still vetoed ==")
+    from lapsmith.gui import controller as C
+    from lapsmith.knowledge import fitness as F
+    from lapsmith.state.tune_state import CarLimits
+    from lapsmith import identity
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+
+    class _Cand:
+        live = True
+
+    def setup(group, fields, prevs, bottoming=False):
+        c = C.Controller(); c.identity = ident; c.apply_setup("road", CarLimits())
+        c.mode = C.MODE_AUTO; c.rigour = "confirmed"; c.best_segment = 47.06
+        c._ref_telem = _Cand()
+        c.stats = aggregate(_window("understeer"))   # so _next_step()'s analyze has stats
+        if bottoming:
+            c._cur_bottoming_axles = {"front"}
+        for fld, p in prevs.items():
+            c.state.current.set(fld, p)
+        c._applied_records = [c.state.apply_change(group, fields, "evidence", "feel")]
+        return c
+
+    oc, oi = F.composite, F.input_difference
+    try:
+        # (a) evidence-backed BOTTOMING fix: composite up, RIDE channel up (bottoming
+        #     reduced), but the driver also drove very differently -> normally discounted.
+        #     With #2 it is KEPT on the telemetry (a warmer driver can't un-bottom the car).
+        F.composite = lambda cand, ref, disc, group="": F.CompositeResult(
+            delta=0.05, ride=0.05, traction=0.0, targeted=0.0, live=True)
+        F.input_difference = lambda cand, ref: 0.5            # would trigger driver-discount
+        ca = setup("ride_height", {"ride_height_f": 12.2}, {"ride_height_f": 10.7}, bottoming=True)
+        ca._gate_change(46.55, 0.0, _Cand())
+        check("evidence bottoming fix KEPT on telemetry despite a big input change (no veto)",
+              ca.state.current.get("ride_height_f") == 12.2
+              and ca._aba is None and ca._aba_saved == 0)
+
+        # (b) WEAK change (ARB, no diagnosed physical fault): composite up but the driver
+        #     drove differently -> still gets the driver-discount veto (reserved for these).
+        F.composite = lambda cand, ref, disc, group="": F.CompositeResult(
+            delta=0.05, ride=0.0, traction=0.0, targeted=0.05, live=True)
+        F.input_difference = lambda cand, ref: 0.5
+        cb = setup("arb", {"arb_r": 55.0}, {"arb_r": 60.0})
+        cb._gate_change(46.55, 0.0, _Cand())
+        check("weak/no-fault change with a driver-input change still gets the discount veto",
+              cb.state.current.get("arb_r") == 60.0 and cb._aba_saved == 1)
+
+        # (c) lap time stays a GUARDRAIL: an evidence fix whose lap is clearly WORSE is
+        #     still reverted (we don't keep something that clearly hurt the lap).
+        F.composite = lambda cand, ref, disc, group="": F.CompositeResult(
+            delta=0.05, ride=0.05, traction=0.0, targeted=0.0, live=True)
+        F.input_difference = lambda cand, ref: 0.0
+        cc = setup("ride_height", {"ride_height_f": 12.2}, {"ride_height_f": 10.7}, bottoming=True)
+        cc._gate_change(47.06 + 0.5, 0.0, _Cand())           # +0.5s clearly worse
+        check("lap time stays a guardrail: a clearly-worse lap reverts even an evidence fix",
+              cc.state.current.get("ride_height_f") == 10.7)
+    finally:
+        F.composite, F.input_difference = oc, oi
+
+
+def test_v0124_drive_only_no_f8():
+    print("\n== v0.1.24: drive-only steps auto-advance (no F8); change steps still need F8 ==")
+    from lapsmith.gui import controller as C
+    from lapsmith.knowledge import rules
+    from lapsmith.state.tune_state import CarLimits
+    from lapsmith import identity
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+
+    class _Live:
+        live = True
+
+    def fresh():
+        c = C.Controller(); c.identity = ident; c.apply_setup("road", CarLimits())
+        c.mode = C.MODE_AUTO; c.rigour = "confirmed"; c.best_segment = 47.06
+        c.stats = aggregate(_window("understeer"))
+        c._on_car = c.state.current.as_dict()
+        return c
+
+    # RE-ANCHOR: nothing to change -> drive-only (no F8), overlay is DRIVE class
+    c = fresh(); c._begin_reanchor()
+    check("re-anchor is a drive-only step (auto-advances, no F8)",
+          c.phase == C.SHOW_CHANGE and c.is_drive_only_step())
+    ui = c.ui_state()
+    check("re-anchor overlay is DRIVE class with no 'F8' in the instruction",
+          ui["klass"] == "drive" and "F8" not in ui["sub"])
+    c.change_applied()                      # what the pump's auto-advance does
+    check("re-anchor auto-advance arms the measured lap (DRIVE_AUTO, no F8 needed)",
+          c.phase == C.DRIVE_AUTO)
+
+    # a REAL change step: fields differ -> NOT drive-only; amber, F8 required
+    c2 = fresh()
+    c2.batch = [rules.Recommendation("arb", {"arb_r": 55.0}, "balance", "")]
+    c2.phase = C.SHOW_CHANGE
+    check("a real change step is NOT drive-only (still needs F8)", not c2.is_drive_only_step())
+    ui2 = c2.ui_state()
+    check("a real change overlay is the amber ACTION (CHANGE THESE NOW) with F8",
+          ui2["klass"] == "action" and ui2["checklist"])
+
+    # A/B/A confirm_revert that SETS values BACK (A != B) -> NOT drive-only (F8 required)
+    c3 = fresh()
+    c3.state.current.set("ride_height_f", 10.0); c3._on_car = c3.state.current.as_dict()
+    c3.batch = [rules.Recommendation("ride_height", {"ride_height_f": 13.0}, "bottoming", "")]
+    c3.change_applied()                     # apply B (on-car -> 13.0)
+    c3._start_aba(46.55, _Live(), type("X", (), {"delta": 0.05})())
+    check("A/B/A revert with values to set back is NOT drive-only (needs F8)",
+          c3.batch[0].group == "confirm_revert" and not c3.is_drive_only_step()
+          and c3.ui_state()["klass"] == "action")
+
+    # A/B/A re-drive where NO value changes (A == B) -> drive-only (auto-advance, no F8)
+    c4 = fresh()
+    c4.state.current.set("ride_height_f", 11.0)
+    applied = c4.state.apply_change("ride_height", {"ride_height_f": 11.0}, "noop", "")
+    c4._applied_records = [applied]; c4._on_car = c4.state.current.as_dict()
+    c4._start_aba(46.55, _Live(), type("X", (), {"delta": 0.05})())
+    check("A/B/A re-drive with no value to set is drive-only (auto-advances, no F8)",
+          c4.batch[0].group == "confirm_revert" and c4.is_drive_only_step()
+          and c4.ui_state()["klass"] == "drive")
+
+
+def test_v0123_oncar_bundled_revert():
+    print("\n== v0.1.23 #3: _on_car stays truthful through a BUNDLED confirm_revert + re-anchor ==")
+    from lapsmith.gui import controller as C
+    from lapsmith.knowledge import rules, fitness as F
+    from lapsmith.state.tune_state import CarLimits
+    from lapsmith import identity
+    ident = identity.identify(parse(simulator._build_packet(simulator.frame(0.5, "understeer"))))
+
+    class _C:
+        live = True
+
+    c = C.Controller(); c.identity = ident; c.apply_setup("road", CarLimits())
+    c.mode = C.MODE_AUTO; c.rigour = "confirmed"; c.best_segment = 47.06
+    c.stats = aggregate(_window("understeer"))
+    c._on_car = c.state.current.as_dict()
+    base = c.state.current.as_dict()
+
+    # apply a BUNDLED 3-field batch (ride height + camber + diff), like iteration 0
+    c.batch = [rules.Recommendation("ride_height", {"ride_height_f": 12.2}, "bottoming 42%", ""),
+               rules.Recommendation("camber", {"camber_r": -1.0}, "rear outer hot", ""),
+               rules.Recommendation("diff", {"diff_rear_decel": 10.0}, "rear lockup", "")]
+    c.change_applied()
+    check("on-car == current tune after the bundled apply (all 3 fields)",
+          c._on_car.get("ride_height_f") == 12.2 and c._on_car.get("camber_r") == -1.0
+          and c._on_car.get("diff_rear_decel") == 10.0)
+
+    # apparent win -> A/B/A: revert the WHOLE bundle to the previous (baseline) values
+    c._start_aba(46.55, _C(), type("X", (), {"delta": 0.05})())
+    check("A/B/A shows a BUNDLED confirm_revert of all 3 fields",
+          c.batch[0].group == "confirm_revert" and len(c.batch[0].fields) == 3)
+    c.change_applied()                                  # user reverts to baseline, drives A'
+    check("after the bundled revert, on-car == state.current (back to baseline)",
+          c._on_car.get("ride_height_f") == base["ride_height_f"]
+          and c._on_car.get("camber_r") == base["camber_r"]
+          and c._on_car.get("diff_rear_decel") == base["diff_rear_decel"]
+          and c._on_car == c.state.current.as_dict())
+
+    # A' is driver-drift -> DISCARD (keep baseline); on-car must still match reality
+    oc = F.composite
+    F.composite = lambda b, a, disc, group="": F.CompositeResult(delta=0.0, live=True)
+    try:
+        c._resolve_aba(46.15, _C())
+    finally:
+        F.composite = oc
+    check("after the A/B/A discard, on-car == state.current (no drift)",
+          c._on_car == c.state.current.as_dict())
+
+    # RE-ANCHOR while genuinely on the current tune -> 'just drive, no change'
+    c._begin_reanchor()
+    st = c.ui_state()
+    check("re-anchor on the matching tune says 'drive, no change' (empty checklist)",
+          st["klass"] == "drive" and not st["checklist"])
+    # but if on-car DIVERGES, the re-anchor states EXACTLY what to set (never a false 'just drive')
+    c._on_car = dict(c._on_car); c._on_car["arb_f"] = 99.0
+    st2 = c.ui_state()
+    check("re-anchor with a diverged on-car shows the exact checklist, not 'just drive'",
+          st2["klass"] == "action" and any(x["field"] == "arb_f" for x in st2["checklist"]))
+
+
+def test_v0122_ocr_celsius_parser():
+    print("\n== v0.1.22: OCR Celsius parser - FH6's degree-Celsius glyph U+2103, 3-zone read ==")
+    from lapsmith.vision import read_tyres as RT
+    import re as _re
+
+    # the EXACT token strings RapidOCR returns on the user's real Heat captures
+    # (built from code points so this file stays ASCII): U+2103 = ℃, U+00B0 = °
+    DEG, CEL = "°", "℃"
+    cases = [(f"99.0 {DEG}{CEL}", 99.0), (f"97.1{CEL}", 97.1), (f"970{CEL}", 97.0),
+             (f"101.9{DEG}{CEL}", 101.9), (f"85.5{CEL}", 85.5), ("99.0°C", 99.0)]
+    for s, want in cases:
+        toks = RT._temp_tokens([(s, (0, 0))])
+        check(f"parse {ascii(s)} -> {want}", len(toks) == 1 and abs(toks[0][0] - want) < 0.05)
+
+    # REGRESSION GUARD: the old ASCII "°C" matcher caught ZERO of these (the whole bug)
+    old = _re.compile(r"^[+-]?\d{1,3}\.\d\s*[°\xba]?\s*[CFcf]?$")
+    celsius = [c for c in cases if CEL in c[0]]      # the real U+2103 tokens (not ASCII °C)
+    check("OLD '[degree]C'-only regex matched 0 of the real Celsius-glyph tokens (the bug)",
+          sum(1 for s, _ in celsius if old.match(str(s).strip())) == 0)
+    check("NEW parser matches every real Celsius-glyph token",
+          all(RT._looks_like_temp(s) for s, _ in cases))
+
+    # junk rejected (speed / lap / position / gamertag / garble)
+    for junk in ["015", "1/12", "1:23.4", "0.6'66", "P1", "568"]:
+        check(f"junk {junk!r} is NOT read as a temp", not RT._looks_like_temp(junk))
+
+    # end-to-end: a full 12-token ℃ Heat grid -> a 3-zone read with inner-vs-outer spread
+    def grid(drop=()):
+        layout = [("FL", 100, [(10, 99.0), (20, 97.1), (30, 85.5)]),
+                  ("RL", 100, [(110, 95.0), (120, 93.0), (130, 82.0)]),
+                  ("FR", 300, [(10, 98.0), (20, 96.0), (30, 84.0)]),
+                  ("RR", 300, [(110, 94.0), (120, 92.0), (130, 81.0)])]
+        toks = []
+        for name, x, zones in layout:
+            for zi, (y, v) in enumerate(zones):
+                if (name, zi) not in drop:
+                    toks.append((f"{v}{CEL}", (x, y)))   # render with the Celsius glyph
+        return toks
+    out = RT.tokens_to_reading(grid(), udp_temps=None)
+    check("full 12-token Celsius grid -> a real 3-zone reading (was None before the fix)",
+          out is not None)
+    if out:
+        check("FL inner/outer recovered (99.0 / 85.5)",
+              abs(out["FL"]["inner"] - 99.0) < 0.1 and abs(out["FL"]["outer"] - 85.5) < 0.1)
+        check("camber gets a real inner-vs-outer spread on the front axle",
+              (out["FL"]["inner"] - out["FL"]["outer"]) > 5.0)
+    # 10 of 12 (both front MIDDLE zones dropped) still reads via gap-split + mid-pad
+    out2 = RT.tokens_to_reading(grid(drop={("FL", 1), ("FR", 1)}), udp_temps=None)
+    check("10/12 (front middles dropped) still yields a usable inner/outer read",
+          out2 is not None and abs(out2["FL"]["inner"] - 99.0) < 0.1
+          and abs(out2["FL"]["outer"] - 85.5) < 0.1)
+
+
 def test_v0120_detection_pause_resilience():
     print("\n== v0.1.20: car detection survives a focus-loss PAUSE; pause vs car-change by ordinal ==")
     from lapsmith.gui import controller as C
@@ -2433,11 +2744,14 @@ def test_rapidocr_mapping():
     # Too few numbers -> no reading (camber falls to lap-time search).
     check("insufficient tokens -> None", read_tyres.tokens_to_reading(
         [("66.0", (10, 10)), ("67.0", (20, 20))], udp_temps=udp) is None)
-    # A misread far from UDP is rejected by the cross-check.
+    # A single wild misread is REPAIRED (the bad zone dropped), not failing all 4 corners
+    # (#1: repair the corner via UDP / outlier-drop rather than discarding the frame).
     bad, _ = _labelled_tokens(1920, 1080)
     bad = [("120.0" if t == "63.7" else t, xy) for t, xy in bad]   # FL inner way off
     out_bad = read_tyres.tokens_to_reading(bad, udp_temps={"FL": 65.9})
-    check("UDP cross-check rejects a misread token set", out_bad is None)
+    check("a single wild misread is repaired, not failing the whole read",
+          out_bad is not None and abs(out_bad.get("FL", {}).get("inner", 0.0) - 120.0) > 40
+          and "FR" in out_bad)
 
 
 def test_camber_search():
@@ -3064,6 +3378,11 @@ if __name__ == "__main__":
     test_session_fixes_v0118()
     test_v0119_shutdown_units_compound_detection()
     test_v0120_detection_pause_resilience()
+    test_v0122_ocr_celsius_parser()
+    test_v0123_ocr_box_coord_mapping()
+    test_v0123_evidence_keep()
+    test_v0123_oncar_bundled_revert()
+    test_v0124_drive_only_no_f8()
     test_install_telemetry_v0117()
     test_batch_changes()
     test_multi_lap_fitness()

@@ -627,6 +627,13 @@ def main(argv=None) -> int:
                                  "session (you can press START TUNING for the new car).")
                 finally:
                     car_change_box["open"] = False
+            # DRIVE-ONLY steps need no F8: a re-anchor / no-change A-B-A re-drive / a
+            # final check already on the baseline has NOTHING to enter in the tune menu,
+            # so auto-advance straight to the measured lap. F8 stays required only where
+            # the user was handed actual change(s) to apply (the amber CHANGE state).
+            if ctrl.phase == C.SHOW_CHANGE and ctrl.is_drive_only_step():
+                log.info("auto-advancing drive-only step (no tune change to apply, no F8)")
+                ctrl.change_applied()
             # AUTO-LAP: while DRIVING (detecting OR auto) start the continuous
             # per-lap Heat capture and run the lap detector each tick. (The bug:
             # tick() only ran once mode was AUTO, but mode only flips INSIDE tick -
