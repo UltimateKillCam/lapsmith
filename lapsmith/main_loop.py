@@ -22,6 +22,7 @@ from .state.tune_state import Tune, TuneState, CarLimits
 from .state import store
 from .vision import read_tyres, read_tune, capture
 from . import PRODUCT_NAME
+from .units import format_speed, telemetry_unit_system
 
 # minimum lateral load (g) that counts as a "real corner" for the Heat capture
 LOAD_MIN_G = HIGH_G_THRESHOLD
@@ -41,6 +42,7 @@ class Config:
     skip_validation: bool = False
     limits: Optional[CarLimits] = None
     started_iso: str = ""
+    telemetry_unit_system: str = "english"
 
 
 # --- minimal console UX (rich if available) --------------------------------
@@ -112,7 +114,8 @@ def _probe_max(listener: TelemetryListener, ui: UI, instruction: str,
     return max(vals) if vals else None
 
 
-def _live_watch(listener: TelemetryListener, seconds: float = 6.0, fps: float = 4.0) -> None:
+def _live_watch(listener: TelemetryListener, seconds: float = 6.0, fps: float = 4.0,
+                unit_system: str = "english") -> None:
     """Refresh the sled block in place (\\r) for `seconds` so the human sees the
     numbers move as they drive, before being asked to confirm."""
     interval = 1.0 / fps
@@ -120,7 +123,8 @@ def _live_watch(listener: TelemetryListener, seconds: float = 6.0, fps: float = 
     while time.time() < deadline:
         s = listener.snapshot()
         if s:
-            line = (f"  Speed {s.speed_mph:6.1f} mph | RPM {s.current_engine_rpm:6.0f} | "
+            speed = format_speed(s.speed, unit_system, 1)
+            line = (f"  Speed {speed:>10s} | RPM {s.current_engine_rpm:6.0f} | "
                     f"Gear {s.gear:2d} | Steer {s.steer:+4d} | Thr {s.accel:3d} | "
                     f"Brk {s.brake:3d} | {s.drivetrain_name:3s} | {s.packet_len}B")
             sys.stdout.write("\r" + line + "    ")
@@ -205,7 +209,8 @@ def _validation_gate(listener: TelemetryListener, ui: UI, cfg: Config) -> "GateR
     # 1. sled-block sanity (Speed/RPM vs HUD) - LIVE polling so values update.
     ui.say("Watch the live values update as you drive:")
     while True:
-        _live_watch(listener, seconds=6.0, fps=4.0)
+        _live_watch(listener, seconds=6.0, fps=4.0,
+                    unit_system=telemetry_unit_system(cfg.telemetry_unit_system))
         ans = ui.ask("Do Speed / RPM / Gear track the HUD?  [y]es / [n]o / "
                      "[r]efresh to watch again").lower()
         if ans in ("y", "yes"):
@@ -228,7 +233,7 @@ def _validation_gate(listener: TelemetryListener, ui: UI, cfg: Config) -> "GateR
     drivetrain = confirmed.drivetrain_name if confirmed else "?"
     if confirmed:
         ui.say(f"   confirmed-live drivetrain = {drivetrain} "
-               f"(at {confirmed.speed_mph:.0f} mph)")
+               f"(at {format_speed(confirmed.speed, cfg.telemetry_unit_system, 0)})")
 
     # 3. POST-INSERT field: brake byte (offset 316)
     b = _probe_max(listener, ui, "Hold FULL BRAKE for ~2s, then press ENTER.",

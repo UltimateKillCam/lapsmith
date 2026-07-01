@@ -40,6 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="screenshot the tune sheet after each change to confirm entry")
     p.add_argument("--skip-validation", action="store_true",
                    help="skip the live validation gate (dry runs / simulator only)")
+    p.add_argument("--telemetry-units", choices=["english", "metric"], default="english",
+                   help="unit system for live telemetry readouts (default: english)")
     p.add_argument("--max-iters", type=int, default=40)
     return p
 
@@ -70,6 +72,7 @@ def main(argv=None) -> int:
         car=args.car, car_class=cls, discipline=disc, front_weight_pct=fw,
         drivetrain=args.drivetrain, port=args.port, manual_vision=args.manual_vision,
         verify_tune=args.verify_tune, skip_validation=args.skip_validation,
+        telemetry_unit_system=args.telemetry_units,
         max_iters=args.max_iters, started_iso=_now_iso(),
     )
     try:

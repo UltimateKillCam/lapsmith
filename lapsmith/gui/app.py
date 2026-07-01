@@ -269,6 +269,7 @@ def main(argv=None) -> int:
                         started_iso=_dt.datetime.now().isoformat(timespec="seconds"))
     ctrl.time_budget_min = prefs.time_budget_min()   # persisted ceiling (default 20)
     ctrl.console_mode = bool(prefs.get("console_mode", False))   # binds 0.0.0.0 if on
+    ctrl.telemetry_unit_system = prefs.telemetry_unit_system()    # live telemetry display units
     pu = prefs.get("pressure_unit", "psi")
     ctrl.pressure_unit = pu if pu in ("psi", "bar") else "psi"   # how pressures display
     ctrl.persist = True                              # enable disk writes (logs/history)

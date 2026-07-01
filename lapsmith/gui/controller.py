@@ -33,6 +33,7 @@ from ..knowledge import fitness
 from ..state.tune_state import Tune, TuneState, CarLimits
 from ..state import store
 from ..telemetry.laps import LapWatcher, LapResult, LAP_TIME_FLOOR
+from ..units import format_speed, speed_value_unit, telemetry_unit_system
 
 LOAD_MIN_G = HIGH_G_THRESHOLD
 RIDE_IMPROVE_MARGIN = 0.02
@@ -72,6 +73,7 @@ class Controller:
     port: int = 5607
     front_weight_pct: float = 50.0
     pressure_unit: str = "psi"             # how tyre pressures are DISPLAYED (psi/bar)
+    telemetry_unit_system: str = "english" # how live telemetry is DISPLAYED (english/metric)
     tyre_compound: str = "Unspecified"     # user-set (not in telemetry); never asserted
     _last_seen_ordinal: int = 0            # last CarOrdinal cached from a live frame
     _car_change_pending: Optional[dict] = None   # mid-session swap awaiting re-setup prompt
@@ -2308,11 +2310,26 @@ class Controller:
             return round(time.time() - lpt, 1)
         return None
 
+    def speed_display(self, snap) -> dict:
+        """Display-ready speed fields for UI surfaces.
+
+        Telemetry math stays canonical in m/s; this only shapes the view model.
+        """
+        unit_system = telemetry_unit_system(self.telemetry_unit_system)
+        self.telemetry_unit_system = unit_system
+        value, unit = speed_value_unit(float(getattr(snap, "speed", 0.0)), unit_system)
+        return {
+            "speed_value": round(value, 1),
+            "speed_unit": unit,
+            "speed_text": format_speed(float(getattr(snap, "speed", 0.0)), unit_system, 1),
+        }
+
     def status(self) -> dict:
         snap = self.snapshot()
         live = None
         if snap:
-            live = {"speed_mph": round(snap.speed_mph, 1),
+            live = {**self.speed_display(snap),
+                    "speed_mph": round(snap.speed_mph, 1),  # legacy/status compatibility
                     "rpm": round(snap.current_engine_rpm),
                     "gear": snap.gear, "lat_g": round(snap.lateral_g, 2),
                     "drivetrain": snap.drivetrain_name,
