@@ -547,6 +547,20 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             self.set_pressure_unit.currentTextChanged.connect(self._set_pressure_unit)
             form.addRow("Pressure unit", self.set_pressure_unit)
 
+            # Telemetry units: speed/readout DISPLAY only. Internal parser/analyzer
+            # units stay canonical (m/s and Celsius), mirroring the pressure-unit
+            # setting's display-edge approach.
+            self.set_telemetry_units = QtWidgets.QComboBox()
+            self.set_telemetry_units.addItem("English", "english")
+            self.set_telemetry_units.addItem("Metric", "metric")
+            cur_tu = _prefs.telemetry_unit_system()
+            self.set_telemetry_units.setCurrentIndex(1 if cur_tu == "metric" else 0)
+            self.set_telemetry_units.setToolTip(
+                "Unit system for live telemetry readouts such as speed. Internal "
+                "tuning math and saved telemetry remain unchanged.")
+            self.set_telemetry_units.currentIndexChanged.connect(self._set_telemetry_units)
+            form.addRow("Telemetry units", self.set_telemetry_units)
+
             self.set_temp = QtWidgets.QComboBox()
             self.set_temp.addItems(["auto", "manual"])
             self.set_temp.setCurrentText(getattr(self.ctrl, "temp_mode", "auto"))
@@ -663,6 +677,14 @@ def build_main_window(ctrl, hooks: Dict[str, Callable]):
             unit = unit if unit in ("psi", "bar") else "psi"
             prefs.set("pressure_unit", unit)
             self.ctrl.pressure_unit = unit
+
+        def _set_telemetry_units(self, *_args):
+            """Persist telemetry display units and apply them live to UI readouts."""
+            from ..state import prefs
+            from ..units import telemetry_unit_system
+            unit = telemetry_unit_system(self.set_telemetry_units.currentData())
+            prefs.set("telemetry_unit_system", unit)
+            self.ctrl.telemetry_unit_system = unit
 
         def _refresh_console_hint(self, on):
             if on:

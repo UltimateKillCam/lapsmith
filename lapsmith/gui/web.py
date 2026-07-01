@@ -20,7 +20,7 @@ _PAGE = """<!doctype html><html><head><meta charset=utf-8>
 async function tick(){try{const r=await fetch('/status');const s=await r.json();
 let h=`<h2>__PRODUCT__ <span class=k>${s.phase}</span></h2>`;
 if(s.car)h+=`<div>${s.car}</div>`;
-if(s.live)h+=`<div>Speed ${s.live.speed_mph} mph | RPM ${s.live.rpm} | Gear ${s.live.gear} | ${s.live.lat_g}g | ${s.live.drivetrain}</div>`;
+if(s.live){const speed=s.live.speed_text||`${s.live.speed_mph} mph`;h+=`<div>Speed ${speed} | RPM ${s.live.rpm} | Gear ${s.live.gear} | ${s.live.lat_g}g | ${s.live.drivetrain}</div>`;}
 if(s.iteration)h+=`<div>iteration ${s.iteration} | ${s.discipline||''} ${s.best_segment_s?('| best '+s.best_segment_s.toFixed(2)+'s'):''}</div>`;
 if(s.change){const f=Object.entries(s.change.fields).map(([k,v])=>k+'='+v).join(', ');
 h+=`<p class=chg>NEXT [${s.change.group}]: ${f}</p><div>${s.change.detail}</div><div class=k>feel: ${s.change.feel}</div>`;}

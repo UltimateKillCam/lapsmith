@@ -17,6 +17,7 @@ _path: str | None = None
 _cache: dict | None = None
 
 DEFAULT_TIME_BUDGET_MIN = 20.0      # mirrors rules.DEFAULT_TIME_BUDGET_MIN
+DEFAULT_TELEMETRY_UNIT_SYSTEM = "english"
 
 
 def set_store_path(path: str) -> None:
@@ -65,3 +66,12 @@ def time_budget_min() -> float:
         return float(get("time_budget_min", DEFAULT_TIME_BUDGET_MIN))
     except (TypeError, ValueError):
         return DEFAULT_TIME_BUDGET_MIN
+
+
+def telemetry_unit_system() -> str:
+    """Persisted telemetry display units; default preserves existing mph readouts."""
+    try:
+        from ..units import telemetry_unit_system as _clean
+        return _clean(get("telemetry_unit_system", DEFAULT_TELEMETRY_UNIT_SYSTEM))
+    except Exception:
+        return DEFAULT_TELEMETRY_UNIT_SYSTEM

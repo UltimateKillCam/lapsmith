@@ -435,7 +435,8 @@ def _render_advanced(st: dict) -> str:
     P = ["<hr style='border:0;border-top:1px solid #2a3140;margin:6px 0'>"]
     live = st.get("live")
     if live:
-        P.append(f"<div style='color:#9cf;font-size:11px'>{live['speed_mph']:.0f}mph "
+        speed = live.get("speed_text") or f"{live.get('speed_mph', 0):.0f} mph"
+        P.append(f"<div style='color:#9cf;font-size:11px'>{_esc(speed)} "
                  f"{live['rpm']:.0f}rpm gear {live['gear']} | "
                  f"lat {live['lat_g']:+.2f}g | {live['drivetrain']} "
                  f"(raw {live.get('drivetrain_raw','?')}) {live.get('num_cylinders','?')}cyl</div>")

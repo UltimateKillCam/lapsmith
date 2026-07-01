@@ -2304,6 +2304,66 @@ def test_v0119_shutdown_units_compound_detection():
           c3.detection_state()["state"] == "car_detected")
 
 
+def test_telemetry_display_units_v0125():
+    print("\n== telemetry display units: persisted English/Metric speed readouts ==")
+    import os
+    import tempfile
+    from lapsmith import simulator
+    from lapsmith.gui import controller as C, overlay, web
+    from lapsmith.state import prefs
+    from lapsmith.units import format_speed, speed_value_unit, telemetry_unit_system
+
+    # Pure helpers: canonical m/s remains the input; only display values change.
+    check("telemetry unit sanitizer defaults invalid values to english",
+          telemetry_unit_system("bogus") == "english")
+    mph, mph_unit = speed_value_unit(10.0, "english")
+    kmh, kmh_unit = speed_value_unit(10.0, "metric")
+    check("10 m/s displays as 22.4 mph in English units",
+          abs(mph - 22.36936) < 0.001 and mph_unit == "mph")
+    check("10 m/s displays as 36.0 km/h in Metric units",
+          abs(kmh - 36.0) < 0.001 and kmh_unit == "km/h")
+    check("format_speed uses consistent labels",
+          format_speed(10.0, "english") == "22.4 mph"
+          and format_speed(10.0, "metric") == "36.0 km/h")
+
+    # Prefs: persisted choice is one source of truth and invalid data is safe.
+    pref_path = os.path.join(tempfile.mkdtemp(), "prefs.json")
+    prefs.set_store_path(pref_path)
+    check("telemetry units default to english", prefs.telemetry_unit_system() == "english")
+    prefs.set("telemetry_unit_system", "metric")
+    check("telemetry units persist as metric", prefs.telemetry_unit_system() == "metric")
+    prefs.set("telemetry_unit_system", "nonsense")
+    check("invalid persisted telemetry unit falls back to english",
+          prefs.telemetry_unit_system() == "english")
+
+    pkt = parse(simulator._build_packet(simulator.frame(0.5, "understeer")))
+    pkt.speed = 10.0
+
+    class _Lis:
+        last_packet_time = time.time()
+        def snapshot(self): return pkt
+
+    c = C.Controller(); c.listener = _Lis()
+    c.telemetry_unit_system = "english"
+    live_en = c.status()["live"]
+    check("status() exposes display speed fields in English units",
+          live_en["speed_unit"] == "mph" and live_en["speed_text"] == "22.4 mph"
+          and abs(live_en["speed_value"] - 22.4) < 0.01)
+    c.telemetry_unit_system = "metric"
+    live_met = c.status()["live"]
+    check("status() exposes display speed fields in Metric units",
+          live_met["speed_unit"] == "km/h" and live_met["speed_text"] == "36.0 km/h"
+          and abs(live_met["speed_value"] - 36.0) < 0.01)
+    check("status() keeps legacy mph field for compatibility",
+          abs(live_met["speed_mph"] - 22.4) < 0.1)
+
+    html = overlay._render_advanced({"live": live_met, "phase": C.TEST})
+    check("overlay advanced render uses the selected telemetry unit",
+          "36.0 km/h" in html and "mph" not in html.split("rpm")[0])
+    check("LAN web view consumes speed_text instead of hardcoding mph",
+          "speed_text" in web._PAGE and "Speed ${s.live.speed_mph} mph" not in web._PAGE)
+
+
 def test_session_fixes_v0118():
     print("\n== v0.1.18: bottoming-coverage, OCR udp fallback, no re-propose, search/bottom split, fastest lap ==")
     from lapsmith.gui import controller as C
@@ -3377,6 +3437,7 @@ if __name__ == "__main__":
     test_recalibration_v0116()
     test_session_fixes_v0118()
     test_v0119_shutdown_units_compound_detection()
+    test_telemetry_display_units_v0125()
     test_v0120_detection_pause_resilience()
     test_v0122_ocr_celsius_parser()
     test_v0123_ocr_box_coord_mapping()
