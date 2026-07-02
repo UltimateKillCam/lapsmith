@@ -33,7 +33,7 @@ from ..knowledge import fitness
 from ..state.tune_state import Tune, TuneState, CarLimits
 from ..state import store
 from ..telemetry.laps import LapWatcher, LapResult, LAP_TIME_FLOOR
-from ..units import format_speed, speed_value_unit, telemetry_unit_system
+from ..units import format_speed, speed_value_unit, telemetry_unit_system as clean_telemetry_unit_system
 
 LOAD_MIN_G = HIGH_G_THRESHOLD
 RIDE_IMPROVE_MARGIN = 0.02
@@ -571,6 +571,7 @@ class Controller:
                     aggressiveness: Optional[str] = None,
                     rigour: Optional[str] = None,
                     time_budget_min: Optional[float] = None,
+                    telemetry_unit_system: Optional[str] = None,
                     console_mode: Optional[bool] = None,
                     drivetrain: Optional[str] = None,
                     compound: Optional[str] = None,
@@ -592,6 +593,8 @@ class Controller:
             self.rigour = rigour
         if time_budget_min is not None:
             self.time_budget_min = max(0.0, float(time_budget_min))
+        if telemetry_unit_system is not None:
+            self.telemetry_unit_system = clean_telemetry_unit_system(telemetry_unit_system)
         self.limits = limits or CarLimits()
         if temp_mode in ("auto", "manual"):
             self.temp_mode = temp_mode
@@ -2327,7 +2330,7 @@ class Controller:
 
         Telemetry math stays canonical in m/s; this only shapes the view model.
         """
-        unit_system = telemetry_unit_system(self.telemetry_unit_system)
+        unit_system = clean_telemetry_unit_system(self.telemetry_unit_system)
         self.telemetry_unit_system = unit_system
         value, unit = speed_value_unit(float(getattr(snap, "speed", 0.0)), unit_system)
         return {

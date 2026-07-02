@@ -2357,6 +2357,12 @@ def test_telemetry_display_units_v0125():
     check("status() keeps legacy mph field for compatibility",
           abs(live_met["speed_mph"] - 22.4) < 0.1)
 
+    c2 = C.Controller(); c2.listener = _Lis()
+    c2.apply_setup("road", CarLimits(), telemetry_unit_system="metric")
+    live_apply = c2.status()["live"]
+    check("apply_setup accepts telemetry units from the setup screen path",
+          live_apply["speed_unit"] == "km/h" and live_apply["speed_text"] == "36.0 km/h")
+
     html = overlay._render_advanced({"live": live_met, "phase": C.TEST})
     check("overlay advanced render uses the selected telemetry unit",
           "36.0 km/h" in html and "mph" not in html.split("rpm")[0])

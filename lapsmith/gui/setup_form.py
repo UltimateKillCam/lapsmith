@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 
 from ..state.tune_state import CarLimits
 from ..knowledge import baseline
+from ..units import telemetry_unit_system
 from .. import PRODUCT_NAME
 
 _DISCIPLINES = ["road circuit", "touge", "dirt", "cross country", "top speed", "drag"]
@@ -23,6 +24,7 @@ def _val(spin) -> Optional[float]:
 def show_setup_dialog(detected_summary: str = "",
                       detected_class: str = "",
                       time_budget_default: float = 20.0,
+                      telemetry_unit_default: str = "english",
                       console_default: bool = False,
                       lan_ip: str = "",
                       detected_drivetrain: str = "") -> Optional[dict]:
@@ -143,6 +145,15 @@ def show_setup_dialog(detected_summary: str = "",
         "Set to 0 for Unlimited / off.")
     form.addRow("Tuning time budget", budget)
 
+    telemetry = QtWidgets.QComboBox()
+    telemetry.addItem("English", "english")
+    telemetry.addItem("Metric", "metric")
+    telemetry.setCurrentIndex(1 if telemetry_unit_system(telemetry_unit_default) == "metric" else 0)
+    telemetry.setToolTip(
+        "Unit system for live telemetry readouts such as speed. Internal tuning math "
+        "and saved telemetry remain unchanged.")
+    form.addRow("Telemetry units", telemetry)
+
     console = QtWidgets.QCheckBox("Forza runs on Xbox/console (telemetry over the LAN)")
     console.setChecked(bool(console_default))
     console.setToolTip(
@@ -254,6 +265,7 @@ def show_setup_dialog(detected_summary: str = "",
             "aggressiveness": ("fine", "normal", "coarse")[aggro.currentIndex()],
             "rigour": "quick" if rigour.currentIndex() == 1 else "confirmed",
             "time_budget_min": float(budget.value()),   # 0 = unlimited
+            "telemetry_unit_system": telemetry.currentData(),
             "console_mode": bool(console.isChecked()),
             "drivetrain": ("auto", "FWD", "RWD", "AWD")[dt.currentIndex()],
             "use_vision_api": bool(vapi.isChecked()),

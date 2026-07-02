@@ -510,6 +510,7 @@ def main(argv=None) -> int:
             res = setup_form.show_setup_dialog(ctrl.identity.summary(),
                                                ctrl.identity.class_letter,
                                                time_budget_default=prefs.time_budget_min(),
+                                               telemetry_unit_default=prefs.telemetry_unit_system(),
                                                console_default=bool(prefs.get("console_mode", False)),
                                                lan_ip=ctrl.lan_ip(),
                                                detected_drivetrain=(ctrl.identity.drivetrain
@@ -520,6 +521,10 @@ def main(argv=None) -> int:
                 return
             if res.get("time_budget_min") is not None:    # share with the main-window control
                 prefs.set("time_budget_min", float(res["time_budget_min"]))
+            if res.get("telemetry_unit_system") is not None:
+                unit = res["telemetry_unit_system"]
+                prefs.set("telemetry_unit_system", unit)
+                ctrl.telemetry_unit_system = unit
             if res.get("console_mode") is not None:        # share with the main-window toggle
                 prefs.set("console_mode", bool(res["console_mode"]))
             ctrl.apply_setup(res["discipline"], res["limits"], res["front_weight"],
@@ -531,6 +536,7 @@ def main(argv=None) -> int:
                              aggressiveness=res.get("aggressiveness"),
                              rigour=res.get("rigour"),
                              time_budget_min=res.get("time_budget_min"),
+                             telemetry_unit_system=res.get("telemetry_unit_system"),
                              console_mode=res.get("console_mode"),
                              drivetrain=res.get("drivetrain"),
                              compound=res.get("compound"),
