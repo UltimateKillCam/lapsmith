@@ -889,9 +889,16 @@ class Controller:
         self._record_outcome("reject")
         self.batch = []
         self._applied_records = []
+        # A live budget edit or an elapsed clock must win over convergence.  Rejections
+        # can make the analyzer converge immediately, so latch the clock before asking
+        # for another batch and preserve a budget stop reason if both are true.
+        self._check_budget()
+        if self._budget_expired and self._telemetry_mode and not self._final_check_done:
+            self._begin_final_check(reason="budget")
+            return
         self._compute_batch()
         if self.phase == DONE and self._telemetry_mode and not self._final_check_done:
-            self._begin_final_check(reason="converged")
+            self._begin_final_check(reason="budget" if self._budget_expired else "converged")
 
     def effective_drivetrain(self) -> str:
         """Drivetrain the rules should tune for: the manual override if set, else the
@@ -1508,6 +1515,11 @@ class Controller:
         """Honest final check (E): re-measure the ORIGINAL baseline tune once more so
         we can tell a real tune gain from the driver simply getting faster. The user
         re-enters the baseline values, clicks Applied -> change_applied arms the test."""
+        # Budget expiry is latched state, not just a caller hint.  If an elapsed budget
+        # races with convergence, the budget reason must win so saved sessions and the
+        # overlay honestly say the run stopped because the clock expired.
+        if self._budget_expired:
+            reason = "budget"
         self._final_check = True
         self._final_check_done = True
         self.stop_reason = (f"stopped: time budget ({int(self.time_budget_min)} min)"
