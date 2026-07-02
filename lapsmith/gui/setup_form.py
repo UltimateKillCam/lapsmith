@@ -14,11 +14,36 @@ from ..units import telemetry_unit_system
 from .. import PRODUCT_NAME
 
 _DISCIPLINES = ["road circuit", "touge", "dirt", "cross country", "top speed", "drag"]
+_CM_PER_IN = 2.54
+_LBIN_PER_KGFMM = 55.997414594958904
 
 
-def _val(spin) -> Optional[float]:
+def _val(spin, kind: str | None = None, unit_system: str = "metric") -> Optional[float]:
     v = spin.value()
-    return None if v == 0 else float(v)
+    if v == 0:
+        return None
+    out = float(v)
+    if kind == "ride_height" and telemetry_unit_system(unit_system) == "english":
+        return out * _CM_PER_IN
+    if kind == "spring" and telemetry_unit_system(unit_system) == "english":
+        return out * _LBIN_PER_KGFMM
+    return out
+
+
+def _display_value(value: float, kind: str | None, unit_system: str) -> float:
+    if kind == "ride_height" and telemetry_unit_system(unit_system) == "english":
+        return value / _CM_PER_IN
+    if kind == "spring" and telemetry_unit_system(unit_system) == "english":
+        return value / _LBIN_PER_KGFMM
+    return value
+
+
+def _unit_suffix(kind: str | None, unit_system: str) -> str:
+    if kind == "ride_height":
+        return " in" if telemetry_unit_system(unit_system) == "english" else " cm"
+    if kind == "spring":
+        return " lb/in" if telemetry_unit_system(unit_system) == "english" else " kgf/mm"
+    return ""
 
 
 def show_setup_dialog(detected_summary: str = "",
@@ -193,7 +218,7 @@ def show_setup_dialog(detected_summary: str = "",
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         c.setMinimumContentsLength(22)
 
-    def pair(label, lo_default, hi_default, suffix=""):
+    def pair(label, lo_default, hi_default, suffix="", kind: str | None = None):
         lo = QtWidgets.QDoubleSpinBox()
         hi = QtWidgets.QDoubleSpinBox()
         for s in (lo, hi):
@@ -211,17 +236,36 @@ def show_setup_dialog(detected_summary: str = "",
         h.addWidget(hi)
         h.addStretch(1)
         form.addRow(label, row)
-        return lo, hi
+        return lo, hi, kind
 
     form.addRow(_wrapped(
         "<i>Slider ranges below: set min and max for each; leave at 0 to skip "
         "that slider.</i>"))
-    rhf = pair("Ride height FRONT", 0, 0, " cm")
-    rhr = pair("Ride height REAR", 0, 0, " cm")
-    sf = pair("Spring FRONT", 0, 0, " kgf/mm")
-    sr = pair("Spring REAR", 0, 0, " kgf/mm")
+    rhf = pair("Ride height FRONT", 0, 0, " cm", kind="ride_height")
+    rhr = pair("Ride height REAR", 0, 0, " cm", kind="ride_height")
+    sf = pair("Spring FRONT", 0, 0, " kgf/mm", kind="spring")
+    sr = pair("Spring REAR", 0, 0, " kgf/mm", kind="spring")
     af = pair("Aero FRONT", 0, 0)
     ar = pair("Aero REAR", 0, 0)
+
+    _physical_ranges = [rhf, rhr, sf, sr]
+    _unit_mode = {"current": telemetry_unit_system(telemetry.currentData())}
+
+    def _refresh_setup_units() -> None:
+        new_unit = telemetry_unit_system(telemetry.currentData())
+        old_unit = _unit_mode["current"]
+        for lo, hi, kind in _physical_ranges:
+            for spin in (lo, hi):
+                current = float(spin.value())
+                if current != 0 and old_unit != new_unit:
+                    canonical = _val(spin, kind, old_unit)
+                    if canonical is not None:
+                        spin.setValue(_display_value(canonical, kind, new_unit))
+                spin.setSuffix(_unit_suffix(kind, new_unit))
+        _unit_mode["current"] = new_unit
+
+    telemetry.currentIndexChanged.connect(lambda _i: _refresh_setup_units())
+    _refresh_setup_units()
 
     buttons = QtWidgets.QDialogButtonBox(
         QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
@@ -238,13 +282,20 @@ def show_setup_dialog(detected_summary: str = "",
     if not accepted:
         return None
 
+    selected_units = telemetry_unit_system(telemetry.currentData())
     lim = CarLimits(
-        ride_height_front_min=_val(rhf[0]), ride_height_front_max=_val(rhf[1]),
-        ride_height_rear_min=_val(rhr[0]), ride_height_rear_max=_val(rhr[1]),
-        spring_front_min=_val(sf[0]), spring_front_max=_val(sf[1]),
-        spring_rear_min=_val(sr[0]), spring_rear_max=_val(sr[1]),
-        aero_front_min=_val(af[0]), aero_front_max=_val(af[1]),
-        aero_rear_min=_val(ar[0]), aero_rear_max=_val(ar[1]),
+        ride_height_front_min=_val(rhf[0], rhf[2], selected_units),
+        ride_height_front_max=_val(rhf[1], rhf[2], selected_units),
+        ride_height_rear_min=_val(rhr[0], rhr[2], selected_units),
+        ride_height_rear_max=_val(rhr[1], rhr[2], selected_units),
+        spring_front_min=_val(sf[0], sf[2], selected_units),
+        spring_front_max=_val(sf[1], sf[2], selected_units),
+        spring_rear_min=_val(sr[0], sr[2], selected_units),
+        spring_rear_max=_val(sr[1], sr[2], selected_units),
+        aero_front_min=_val(af[0], af[2], selected_units),
+        aero_front_max=_val(af[1], af[2], selected_units),
+        aero_rear_min=_val(ar[0], ar[2], selected_units),
+        aero_rear_max=_val(ar[1], ar[2], selected_units),
     )
     # discard half-entered pairs
     for lo, hi in (("ride_height_front_min", "ride_height_front_max"),
